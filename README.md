@@ -41,6 +41,11 @@ turn is done.
   - `/explain <topic>` — explain a topic in plain language.
   - `/review [focus]` — review recent work for bugs, risks, and style.
   - `/tests [target]` — generate and run tests for the target.
+  - `/skill <name>` — force-load a saved skill; its full content is injected
+    into the context as mandatory instructions. Type `/skill ` (with a space)
+    to pick from the skills library with autocomplete.
+  - `/compact` — manually compact the conversation context now (though the
+    app also does this automatically at 80% context usage).
 - **Skills library** — reusable markdown documents (workflows, guidelines,
   templates) the agent can load with `use_skill` and persist with
   `create_skill`. Skills support YAML frontmatter (`name`, `description`).

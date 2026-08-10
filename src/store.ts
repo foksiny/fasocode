@@ -54,9 +54,39 @@ export async function loadState(): Promise<LoadResult> {
 }
 
 export async function saveState(state: PersistedState): Promise<void> {
+  pendingState = state;
+  if (saveTimer) clearTimeout(saveTimer);
+  return new Promise((resolve) => {
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      const s = pendingState;
+      pendingState = null;
+      if (!s) {
+        resolve();
+        return;
+      }
+      writeState(s).then(resolve, resolve);
+    }, 600);
+  });
+}
+
+export function flushState(): void {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  const s = pendingState;
+  pendingState = null;
+  if (s) void writeState(s);
+}
+
+let pendingState: PersistedState | null = null;
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function writeState(state: PersistedState): Promise<void> {
   try {
     await mkdir(".", { baseDir: BaseDirectory.AppConfig, recursive: true });
-    await writeTextFile(FILE, JSON.stringify(state, null, 2), { baseDir: BaseDirectory.AppConfig });
+    await writeTextFile(FILE, JSON.stringify(state), { baseDir: BaseDirectory.AppConfig });
   } catch (err) {
     console.error("Failed to save state:", err);
   }

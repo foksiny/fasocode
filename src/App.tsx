@@ -1,13 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { readTextFile, writeTextFile, readDir, remove } from "@tauri-apps/plugin-fs";
 import { fetch as httpFetch } from "@tauri-apps/plugin-http";
-import { loadState, saveState } from "./store";
-import { runAgenticLoop, errMessage, fetchModelCapabilities, estimateContextTokens, DEFAULT_CONTEXT_WINDOW, type ReasoningLevel, type ThinkingEffort } from "./ai";
+import { loadState, saveState, flushState } from "./store";
+import { runAgenticLoop, errMessage, fetchModelCapabilities, estimateContextTokens, compactConversation, DEFAULT_CONTEXT_WINDOW, type ReasoningLevel, type ThinkingEffort } from "./ai";
 import "./App.css";
 
 const TEXTS = [
@@ -35,7 +36,7 @@ export type UserMessage = {
   args?: string;
   status?: ToolStatus;
   result?: string;
-  undo?: UndoData;
+  undo?: UndoData | UndoData[];
   thinking?: string;
 };
 export type TodoItem = { id: number; task: string; done: boolean };
@@ -172,7 +173,132 @@ const MIN_WIDTH = 150;
 const MAX_WIDTH = 450;
 const INPUT_MAX_HEIGHT = 140;
 const READ_CHUNK_LIMIT = 50000;
+const HYPERTool_RESULT_LIMIT = 250000;
 const RESULT_PREVIEW_LIMIT = 3000;
+
+function formatElapsed(sec: number): string {
+  const s = Math.floor(sec);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m:${String(s % 60).padStart(2, "0")}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h:${String(m % 60).padStart(2, "0")}m:${String(s % 60).padStart(2, "0")}s`;
+}
+
+type MessageViewProps = {
+  m: UserMessage;
+  isEditing: boolean;
+  editDraft: string;
+  isThinkingExpanded: boolean;
+  isToolExpanded: boolean;
+  showIndicator: boolean;
+  sending: boolean;
+  elapsed: number;
+  mentionFiles: string[];
+  onContextMenu: (e: React.MouseEvent, id: number) => void;
+  onToggleThinking: (id: number) => void;
+  onToggleTool: (id: number) => void;
+  onEditChange: (v: string) => void;
+  onEditBlur: () => void;
+  onEditKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+};
+
+const MessageView = memo(function MessageView({
+  m,
+  isEditing,
+  editDraft,
+  isThinkingExpanded,
+  isToolExpanded,
+  showIndicator,
+  sending,
+  elapsed,
+  mentionFiles,
+  onContextMenu,
+  onToggleThinking,
+  onToggleTool,
+  onEditChange,
+  onEditBlur,
+  onEditKeyDown,
+}: MessageViewProps) {
+  return (
+    <div
+      className={`chat-message ${m.role === "assistant" ? "assistant" : m.role === "user" ? "user" : "tool"}`}
+      onContextMenu={(e) => onContextMenu(e, m.id)}
+    >
+      {m.role === "tool" ? (
+        <>
+          <div className="tool-event" onClick={() => onToggleTool(m.id)}>
+            <span className={`tool-event-icon ${m.status ?? ""}`}>
+              {m.status === "error" ? <CloseIcon /> : <BotIcon />}
+            </span>
+            <span className="tool-event-name">{m.toolName}</span>
+            <span className="tool-event-args">{truncateText(m.args ?? "", 120)}</span>
+            <span className={`tool-event-status ${m.status ?? ""}`}>
+              {m.status === "running" ? "running" : m.status === "error" ? "failed" : "done"}
+            </span>
+          </div>
+          {(m.status !== "running" || (m.result ?? "").length > 0) && (
+            <pre
+              className={`tool-event-result ${m.status === "running" ? "streaming" : ""} ${
+                isToolExpanded ? "expanded" : ""
+              }`}
+            >
+              {truncateText(
+                m.result ?? "",
+                m.status === "running" || isToolExpanded ? Number.MAX_SAFE_INTEGER : RESULT_PREVIEW_LIMIT,
+              )}
+            </pre>
+          )}
+        </>
+      ) : isEditing ? (
+        <textarea
+          className="chat-message-edit"
+          rows={2}
+          autoFocus
+          value={editDraft}
+          onChange={(e) => onEditChange(e.target.value)}
+          onBlur={onEditBlur}
+          onKeyDown={onEditKeyDown}
+        />
+      ) : (
+        <>
+          {m.role === "assistant" && m.thinking ? (
+            <div className="thinking-block">
+              <button
+                className={`thinking-toggle ${isThinkingExpanded ? "open" : ""}`}
+                onClick={() => onToggleThinking(m.id)}
+              >
+                <span className="thinking-chevron">▸</span>
+                <span className="thinking-label">Thinking</span>
+                {m.thinking.length > 0 && (
+                  <span className="thinking-count">
+                    {Math.max(1, Math.round(m.thinking.length / 4))} tokens
+                  </span>
+                )}
+              </button>
+              {isThinkingExpanded && <div className="thinking-content">{m.thinking}</div>}
+            </div>
+          ) : null}
+          <div className="chat-message-text chat-md">
+            <ReactMarkdown remarkPlugins={[remarkBreaks, remarkGfm]}>
+              {m.role === "user" ? highlightMentions(m.text, mentionFiles) : m.text}
+            </ReactMarkdown>
+          </div>
+          <div className="chat-message-time">
+            {new Date(m.sentAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+          </div>
+          {showIndicator && (
+            <span className={`work-indicator ${sending ? "live" : ""}`}>
+              {sending ? "Working for " : "Worked for "}
+              {formatElapsed(elapsed)}
+              {sending ? "..." : ""}
+            </span>
+          )}
+        </>
+      )}
+    </div>
+  );
+});
 
 function resolveInProject(folder: string | null, rel: string): string {
   if (!folder) throw new Error("Project has no folder selected");
@@ -194,6 +320,18 @@ function resolveInProject(folder: string | null, rel: string): string {
 
 function truncateText(s: string, limit: number): string {
   return s.length > limit ? `${s.slice(0, limit)}\n...[truncated]` : s;
+}
+
+function hypertoolArgSummary(args: Record<string, unknown>): string {
+  const steps = Array.isArray(args.steps) ? args.steps : [];
+  const parts = steps.map((s) => {
+    const o = s as { name?: unknown; args?: Record<string, unknown> };
+    const n = String(o.name ?? "?");
+    const path = typeof o.args?.path === "string" ? `("${o.args.path}")` : "";
+    const command = typeof o.args?.command === "string" ? `(${o.args.command.slice(0, 40)}…)` : "";
+    return `${n}${path || command}`;
+  });
+  return parts.length > 0 ? `${parts.length} steps: ${parts.join(", ")}` : "(no steps)";
 }
 
 const SKIPPED_DIRS = new Set([
@@ -280,6 +418,18 @@ const SLASH_COMMANDS: SlashCommand[] = [
     apply: (rest) =>
       `Generate tests for the following work and run them; report results and fix failures when reasonable. ${rest ? `Target: ${rest}.` : ""}`,
   },
+  {
+    cmd: "/skill",
+    desc: "Force-load a saved skill into this message",
+    template: "/skill ",
+    apply: () => "Skill requested by the user.",
+  },
+  {
+    cmd: "/compact",
+    desc: "Manually compact the conversation context now",
+    template: "/compact",
+    apply: () => "Compact the conversation context.",
+  },
 ];
 
 export type AskQuestion = {
@@ -321,6 +471,7 @@ type PromptBoxProps = {
   ctxUsed: number;
   ctxMax: number;
   mentionFiles: string[];
+  skills: Skill[];
   onChange: (value: string) => void;
   onSend: () => void;
   onStop: () => void;
@@ -355,6 +506,7 @@ function PromptBox({
   ctxUsed,
   ctxMax,
   mentionFiles,
+  skills,
   onChange,
   onSend,
   onStop,
@@ -369,6 +521,9 @@ function PromptBox({
   const [slashOpen, setSlashOpen] = useState(false);
   const [slashQuery, setSlashQuery] = useState("");
   const [slashIndex, setSlashIndex] = useState(0);
+  const [skillOpen, setSkillOpen] = useState(false);
+  const [skillQuery, setSkillQuery] = useState("");
+  const [skillIndex, setSkillIndex] = useState(0);
 
   useEffect(() => {
     if (!pickerOpen) return;
@@ -411,6 +566,16 @@ function PromptBox({
     ? SLASH_COMMANDS.filter((c) => c.cmd.startsWith(`/${slashQuery.toLowerCase()}`))
     : [];
 
+  const skillItems = skillOpen
+    ? skills
+        .filter(
+          (s) =>
+            s.name.toLowerCase().includes(skillQuery.toLowerCase()) ||
+            s.description.toLowerCase().includes(skillQuery.toLowerCase()),
+        )
+        .slice(0, 100)
+    : [];
+
   function updateMention(text: string, caret: number) {
     const before = text.slice(0, caret);
     const m = before.match(/(?:^|\s)@([^\s@]*)$/);
@@ -428,6 +593,14 @@ function PromptBox({
       setSlashIndex(0);
     } else {
       setSlashOpen(false);
+    }
+    const skm = text.match(/^\/skill\s+([^\s@]*)$/);
+    if (skm) {
+      setSkillQuery(skm[1]);
+      setSkillOpen(true);
+      setSkillIndex(0);
+    } else {
+      setSkillOpen(false);
     }
   }
 
@@ -454,6 +627,19 @@ function PromptBox({
       const el = inputRef.current;
       if (el) {
         const pos = cmd.template.length;
+        el.setSelectionRange(pos, pos);
+        el.focus();
+      }
+    });
+  }
+
+  function selectSkill(s: Skill) {
+    onChange(`/skill ${s.name} `);
+    setSkillOpen(false);
+    requestAnimationFrame(() => {
+      const el = inputRef.current;
+      if (el) {
+        const pos = `/skill ${s.name} `.length;
         el.setSelectionRange(pos, pos);
         el.focus();
       }
@@ -522,6 +708,28 @@ function PromptBox({
                 return;
               }
             }
+            if (skillOpen && skillItems.length > 0) {
+              if (e.key === "ArrowDown") {
+                e.preventDefault();
+                setSkillIndex((i) => (i + 1) % skillItems.length);
+                return;
+              }
+              if (e.key === "ArrowUp") {
+                e.preventDefault();
+                setSkillIndex((i) => (i - 1 + skillItems.length) % skillItems.length);
+                return;
+              }
+              if (e.key === "Enter" || e.key === "Tab") {
+                e.preventDefault();
+                selectSkill(skillItems[skillIndex]);
+                return;
+              }
+              if (e.key === "Escape") {
+                e.preventDefault();
+                setSkillOpen(false);
+                return;
+              }
+            }
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
               onSend();
@@ -543,6 +751,26 @@ function PromptBox({
                 >
                   <span className="slash-cmd">{c.cmd}</span>
                   <span className="slash-desc">{c.desc}</span>
+                </button>
+              ))
+            )}
+          </div>
+        )}
+        {skillOpen && (
+          <div className="mention-menu" onMouseDown={(e) => e.stopPropagation()}>
+            {skillItems.length === 0 ? (
+              <div className="mention-empty">No skills match</div>
+            ) : (
+              skillItems.map((s, i) => (
+                <button
+                  key={s.id}
+                  className={`mention-item ${i === skillIndex ? "active" : ""}`}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => selectSkill(s)}
+                  onMouseEnter={() => setSkillIndex(i)}
+                >
+                  <span className="slash-cmd">{s.name}</span>
+                  <span className="slash-desc">{s.description}</span>
                 </button>
               ))
             )}
@@ -719,7 +947,21 @@ function App() {
   const [expandedToolId, setExpandedToolId] = useState<number | null>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const idRef = useRef(1);
-  const pendingUndoRef = useRef<UndoData | null>(null);
+  const pendingUndoRef = useRef<UndoData | UndoData[] | null>(null);
+  const selectedProjectIdRef = useRef<number | null>(null);
+  selectedProjectIdRef.current = selectedProjectId;
+  const projectsRef = useRef(projects);
+  projectsRef.current = projects;
+  const editingMessageIdRef = useRef<number | null>(null);
+  editingMessageIdRef.current = editingMessageId;
+  const editDraftRef = useRef("");
+  editDraftRef.current = editDraft;
+  const sendingRef = useRef(false);
+  sendingRef.current = sending;
+  const sendMessageRef = useRef(sendMessage);
+  sendMessageRef.current = sendMessage;
+  const applyUndosRef = useRef(applyUndos);
+  applyUndosRef.current = applyUndos;
   const [hydrated, setHydrated] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const paused = value !== "";
@@ -792,6 +1034,16 @@ function App() {
     if (!hydrated) return;
     saveState({ apiKeys, models, skills, projects, selectedModelId, selectedProjectId, selectedChatId, reasoningLevel });
   }, [hydrated, apiKeys, models, skills, projects, selectedModelId, selectedProjectId, selectedChatId, reasoningLevel]);
+
+  useEffect(() => {
+    const flush = () => flushState();
+    window.addEventListener("beforeunload", flush);
+    window.addEventListener("pagehide", flush);
+    return () => {
+      window.removeEventListener("beforeunload", flush);
+      window.removeEventListener("pagehide", flush);
+    };
+  }, []);
 
   useEffect(() => {
     const blink = setInterval(() => setCaret((c) => !c), 500);
@@ -1022,7 +1274,7 @@ function App() {
     );
   }
 
-  function updateToolMessage(messageId: number, status: ToolStatus, result: string, undo?: UndoData | null) {
+  function appendToolMessageResult(messageId: number, chunk: string) {
     setProjects((ps) =>
       ps.map((p) =>
         p.id === selectedProjectId
@@ -1033,7 +1285,63 @@ function App() {
                   ? {
                       ...c,
                       messages: c.messages.map((m) =>
-                        m.id === messageId ? { ...m, status, result, undo: undo ?? m.undo } : m,
+                        m.id === messageId ? { ...m, result: (m.result ?? "") + chunk } : m,
+                      ),
+                    }
+                  : c,
+              ),
+            }
+          : p,
+      ),
+    );
+  }
+
+  function setToolMessageStatus(messageId: number, status: ToolStatus, suffix?: string) {
+    setProjects((ps) =>
+      ps.map((p) =>
+        p.id === selectedProjectId
+          ? {
+              ...p,
+              chats: p.chats.map((c) =>
+                c.id === selectedChatId
+                  ? {
+                      ...c,
+                      messages: c.messages.map((m) =>
+                        m.id === messageId
+                          ? { ...m, status, result: suffix ? `${m.result ?? ""}${suffix}` : m.result }
+                          : m,
+                      ),
+                    }
+                  : c,
+              ),
+            }
+          : p,
+      ),
+    );
+  }
+
+  function updateToolMessage(messageId: number, status: ToolStatus, result: string, undo?: UndoData | UndoData[] | null) {
+    setProjects((ps) =>
+      ps.map((p) =>
+        p.id === selectedProjectId
+          ? {
+              ...p,
+              chats: p.chats.map((c) =>
+                c.id === selectedChatId
+                  ? {
+                      ...c,
+                      messages: c.messages.map((m) =>
+                        m.id === messageId
+                          ? {
+                              ...m,
+                              status,
+                              result:
+                                status === "error" && m.result
+                                  ? `${m.result}\n\n[error] ${result}`
+                                  : result,
+                              undo: undo ?? m.undo,
+                            }
+                          : m,
                       ),
                     }
                   : c,
@@ -1065,6 +1373,28 @@ function App() {
     setModelWarning(true);
     if (warningTimerRef.current) clearTimeout(warningTimerRef.current);
     warningTimerRef.current = setTimeout(() => setModelWarning(false), 2500);
+  }
+
+  function skillListingText(prefix?: string): string {
+    const lines =
+      skills.length === 0
+        ? "(the skills library is empty; you can create a skill with create_skill)"
+        : skills.map((s) => `- ${s.name}: ${s.description}`).join("\n");
+    return prefix ? `${prefix}\nAvailable skills:\n${lines}` : `Available skills:\n${lines}`;
+  }
+
+  function forcedSkillText(term: string): string {
+    const t = term.trim().toLowerCase();
+    if (!t) return skillListingText("The user invoked /skill without naming a skill. Inform them what is available.");
+    const byName = skills.find((s) => s.name.toLowerCase() === t);
+    const matched = byName
+      ? [byName]
+      : skills.filter((s) => s.name.toLowerCase().includes(t) || s.description.toLowerCase().includes(t));
+    if (matched.length === 0)
+      return skillListingText(`The user invoked /skill "${term.trim()}" but no skill matched. Inform them what is available.`);
+    return matched
+      .map((s) => `FORCED SKILL: ${s.name} — ${s.description}\n\nThe user has explicitly forced this skill. Follow it as mandatory instructions for the task below.\n\n${s.content}`)
+      .join("\n\n---\n\n");
   }
 
   async function sendMessage(textOverride?: string, baseMessages?: UserMessage[], force?: boolean) {
@@ -1104,6 +1434,12 @@ function App() {
       return;
     }
 
+    if (textToSend === "/compact" || textToSend.startsWith("/compact ")) {
+      setValue("");
+      await handleManualCompact(chat, model, apiKey);
+      return;
+    }
+
     const userMsg: UserMessage = { id: idRef.current++, role: "user", text: textToSend, sentAt: Date.now() };
     appendMessage(userMsg);
     setValue("");
@@ -1116,7 +1452,11 @@ function App() {
     const slashCmd = SLASH_COMMANDS.find((c) => textToSend.startsWith(c.cmd) && (textToSend.length === c.cmd.length || /\s/.test(textToSend[c.cmd.length])));
     if (slashCmd) {
       const rest = textToSend.slice(slashCmd.cmd.length).trim();
-      history.unshift({ role: "user", text: slashCmd.apply(rest) });
+      if (slashCmd.cmd === "/skill") {
+        history.unshift({ role: "user", text: forcedSkillText(rest) });
+      } else {
+        history.unshift({ role: "user", text: slashCmd.apply(rest) });
+      }
     }
     if (project.folder) {
       const mentionParts: string[] = [];
@@ -1150,6 +1490,46 @@ function App() {
     let assistantId: number | null = null;
     let toolMsgId: number | null = null;
     let thinkingStreamed = false;
+    let abortedRef = false;
+    let pendingText = "";
+    let pendingThinking = "";
+    let pendingToolStream = "";
+    let rafId: number | null = null;
+    let rafMessageId: number | null = null;
+    let toolRafId: number | null = null;
+
+    function scheduleToolFlush() {
+      if (toolRafId !== null) return;
+      toolRafId = requestAnimationFrame(() => {
+        toolRafId = null;
+        if (toolMsgId === null) return;
+        const chunk = pendingToolStream;
+        pendingToolStream = "";
+        if (!chunk) return;
+        appendToolMessageResult(toolMsgId, chunk);
+      });
+    }
+
+    function scheduleStreamFlush(messageId: number | null) {
+      if (rafId !== null || messageId === null) return;
+      rafMessageId = messageId;
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        const mid = rafMessageId;
+        rafMessageId = null;
+        if (mid === null) return;
+        if (pendingText) {
+          const t = pendingText;
+          pendingText = "";
+          appendMessageText(mid, (prev) => prev + t);
+        }
+        if (pendingThinking) {
+          const t = pendingThinking;
+          pendingThinking = "";
+          appendMessageThinking(mid, (prev) => (prev ?? "") + t);
+        }
+      });
+    }
 
     function skillListing(prefix?: string): string {
       const lines = skills.length === 0
@@ -1159,14 +1539,151 @@ function App() {
     }
 
     const runTool = async (name: string, args: Record<string, unknown>): Promise<string> => {
-      if (name === "run_command") {        const command = String(args.command ?? "");
+      if (name === "run_command") {
+        const command = String(args.command ?? "");
         if (!command.trim()) throw new Error("command is required");
-        const result = await invoke("tool_run_command", {
-          command,
-          folder: project.folder ?? "",
-          timeout: args.timeout != null ? Number(args.timeout) : null,
+        const timeout = args.timeout != null ? Number(args.timeout) : null;
+        const token = crypto.randomUUID?.() ?? `cmd-${Date.now()}-${Math.random()}`;
+        return await new Promise<string>((resolve, reject) => {
+          let settled = false;
+          let commandId: number | null = null;
+          let unlistenFns: Array<() => void> = [];
+          const finish = (fn: () => void) => {
+            if (settled) return;
+            settled = true;
+            for (const un of unlistenFns) un();
+            clearTimeout(watchdog);
+            controller.signal.removeEventListener("abort", onAbort);
+            fn();
+          };
+          const onAbort = () => {
+            if (commandId !== null) void invoke("tool_kill_command", { id: commandId });
+            finish(() => reject(new DOMException("Aborted", "AbortError")));
+          };
+          controller.signal.addEventListener("abort", onAbort, { once: true });
+          const watchdog = setTimeout(
+            () => finish(() => reject(new Error(`command did not finish within ${timeout ?? 30}s`))),
+            ((timeout ?? 30) * 1000) + 15000,
+          );
+          void (async () => {
+            try {
+              const [unOut, unDone] = await Promise.all([
+                listen<{ id: number; token: string; stream: string; chunk: string }>(
+                  "tool-command-output",
+                  (e) => {
+                    if (e.payload.token !== token) return;
+                    const chunk = e.payload.chunk ?? "";
+                    if (!chunk) return;
+                    pendingToolStream += chunk;
+                    scheduleToolFlush();
+                  },
+                ),
+                listen<{ id: number; token: string; exit_code: number | null; timed_out: boolean; error: string | null; output: string }>(
+                  "tool-command-finished",
+                  (e) => {
+                    if (e.payload.token !== token) return;
+                    if (toolMsgId !== null && pendingToolStream) {
+                      const chunk = pendingToolStream;
+                      pendingToolStream = "";
+                      appendToolMessageResult(toolMsgId, chunk);
+                    }
+                    finish(() => {
+                      if (e.payload.error) {
+                        const partial = e.payload.output ?? "";
+                        reject(
+                          new Error(
+                            partial
+                              ? `${e.payload.error}\n\n(partial output below)\n${partial}`
+                              : e.payload.error,
+                          ),
+                        );
+                      } else {
+                        resolve(e.payload.output ?? "");
+                      }
+                    });
+                  },
+                ),
+              ]);
+              if (settled) {
+                unOut();
+                unDone();
+                return;
+              }
+              unlistenFns = [unOut, unDone];
+              const id = await invoke<number>("tool_run_command", {
+                command,
+                folder: project.folder ?? "",
+                timeout,
+                token,
+              });
+              commandId = id;
+              if (controller.signal.aborted) onAbort();
+            } catch (err) {
+              finish(() => reject(err));
+            }
+          })();
         });
-        return truncateText(String(result), READ_CHUNK_LIMIT);
+      }
+      if (name === "hypertool") {
+        const steps = Array.isArray(args.steps) ? (args.steps as { name?: unknown; args?: unknown }[]) : null;
+        if (!steps || steps.length === 0) throw new Error("steps must be a non-empty array of {name, args}");
+        const stopOnError = args.stop_on_error !== false;
+        const results: string[] = [];
+        const undos: UndoData[] = [];
+        let failed = 0;
+        for (let i = 0; i < steps.length; i++) {
+          const stepName = String(steps[i]?.name ?? "").trim();
+          const stepArgs =
+            steps[i]?.args && typeof steps[i].args === "object"
+              ? (steps[i].args as Record<string, unknown>)
+              : {};
+          if (!stepName) {
+            const errMsg = `[step ${i + 1}] <missing tool name> skipped`;
+            if (stopOnError) throw new Error(errMsg);
+            failed++;
+            results.push(errMsg);
+            continue;
+          }
+          if (stepName === "hypertool") {
+            const errMsg = `[step ${i + 1}] hypertool: cannot nest hypertool inside hypertool`;
+            if (stopOnError) throw new Error(errMsg);
+            failed++;
+            results.push(errMsg);
+            continue;
+          }
+          if (stepName === "ask_user") {
+            const errMsg = `[step ${i + 1}] hypertool: ask_user cannot run inside hypertool`;
+            if (stopOnError) throw new Error(errMsg);
+            failed++;
+            results.push(errMsg);
+            continue;
+          }
+          const undoBefore = pendingUndoRef.current;
+          try {
+            const stepResult = await runTool(stepName, stepArgs);
+            const undoAfter = pendingUndoRef.current;
+            if (undoAfter && undoAfter !== undoBefore) {
+              if (Array.isArray(undoAfter)) undos.push(...undoAfter);
+              else undos.push(undoAfter);
+            }
+            const pathArg = typeof stepArgs.path === "string" ? stepArgs.path : "";
+            const argStr = pathArg ? `"${pathArg}"` : JSON.stringify(stepArgs);
+            const short = argStr.length > 80 ? `${argStr.slice(0, 80)}…` : argStr;
+            const stepOut = `[step ${i + 1}] ${stepName}(${short})\n${stepResult}`;
+            results.push(stepOut);
+            if (toolMsgId !== null) appendToolMessageResult(toolMsgId, `\n\n${stepOut}`);
+          } catch (err) {
+            const errMsg = `[step ${i + 1}] ${stepName}: ${errMessage(err)}`;
+            if (stopOnError) throw new Error(errMsg);
+            failed++;
+            results.push(errMsg);
+            if (toolMsgId !== null) appendToolMessageResult(toolMsgId, `\n\n${errMsg}`);
+          }
+        }
+        pendingUndoRef.current = undos.length ? (undos.length === 1 ? undos[0] : undos) : null;
+        const ok = results.length - failed;
+        const summary = `\n\nSummary: ${ok}/${results.length} steps succeeded${failed > 0 ? `, ${failed} failed` : ""}.`;
+        return truncateText(results.join("\n\n") + summary, HYPERTool_RESULT_LIMIT);
       }
       if (name === "use_skill") {
         const term = String(args.name ?? "").trim().toLowerCase();
@@ -1409,6 +1926,7 @@ function App() {
             appendMessage({ id: assistantId, role: "assistant", text: "", sentAt: Date.now() });
           },
           onCompress: (summary) => {
+            if (selectedChatIdRef.current !== chat.id) return;
             appendMessage({
               id: idRef.current++,
               role: "assistant",
@@ -1424,15 +1942,17 @@ function App() {
               return;
             }
             if (assistantId !== null) {
-              appendMessageText(assistantId, (prev) => prev + delta);
+              pendingText += delta;
               if (thinkingStreamed) setExpandedThinkingId(null);
+              scheduleStreamFlush(assistantId);
             }
           },
           onThinking: (delta) => {
             if (assistantId !== null) {
               thinkingStreamed = true;
-              appendMessageThinking(assistantId, (prev) => (prev ?? "") + delta);
+              pendingThinking += delta;
               if (!thinkingToggledRef.current.has(assistantId)) setExpandedThinkingId(assistantId);
+              scheduleStreamFlush(assistantId);
             }
           },
           onToolStart: (call) => {
@@ -1445,7 +1965,7 @@ function App() {
               text: "",
               sentAt: Date.now(),
               toolName: call.name,
-              args: JSON.stringify(call.args),
+              args: call.name === "hypertool" ? hypertoolArgSummary(call.args) : JSON.stringify(call.args),
               status: "running",
             });
           },
@@ -1462,6 +1982,7 @@ function App() {
       );
     } catch (err) {
       const aborted = err instanceof Error && (err as Error).name === "AbortError";
+      abortedRef = aborted;
       if (aborted) {
         removeTrailingEmptyAssistant();
       } else {
@@ -1473,6 +1994,28 @@ function App() {
         });
       }
     } finally {
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      rafId = null;
+      if (toolRafId !== null) cancelAnimationFrame(toolRafId);
+      toolRafId = null;
+      if (assistantId !== null) {
+        if (pendingText) {
+          appendMessageText(assistantId, (prev) => prev + pendingText);
+          pendingText = "";
+        }
+        if (pendingThinking) {
+          appendMessageThinking(assistantId, (prev) => (prev ?? "") + pendingThinking);
+          pendingThinking = "";
+        }
+      }
+      if (toolMsgId !== null && pendingToolStream) {
+        const chunk = pendingToolStream;
+        pendingToolStream = "";
+        appendToolMessageResult(toolMsgId, chunk);
+      }
+      if (abortedRef && toolMsgId !== null) {
+        setToolMessageStatus(toolMsgId, "error", "\n\n[command stopped by user]");
+      }
       if (thinkingStreamed) setExpandedThinkingId(null);
       setTimerActive(false);
       setSending(false);
@@ -1480,13 +2023,74 @@ function App() {
     }
   }
 
-  function formatElapsed(sec: number): string {
-    const s = Math.floor(sec);
-    if (s < 60) return `${s}s`;
-    const m = Math.floor(s / 60);
-    if (m < 60) return `${m}m:${String(s % 60).padStart(2, "0")}s`;
-    const h = Math.floor(m / 60);
-    return `${h}h:${String(m % 60).padStart(2, "0")}m:${String(s % 60).padStart(2, "0")}s`;
+  async function handleManualCompact(chat: Chat, model: Model, apiKey: string) {
+    const controller = new AbortController();
+    sendAbortRef.current = controller;
+    const noticeId = idRef.current++;
+    appendMessage({ id: noticeId, role: "assistant", text: "Compacting context…", sentAt: Date.now() });
+    setSending(true);
+    setElapsed(0);
+    setTimerActive(true);
+    try {
+      const res = await compactConversation({
+        providerId: model.providerId,
+        modelName: model.name,
+        apiKey,
+        messages: chat.messages.map((m) => ({
+          role: m.role,
+          text: m.role === "tool" ? (m.result ?? "") : m.text,
+        })),
+        signal: controller.signal,
+      });
+      if (selectedChatIdRef.current !== chat.id) return;
+      if (controller.signal.aborted) {
+        appendMessageText(noticeId, () => "Compaction cancelled.");
+        return;
+      }
+      if (res.summary === null) {
+        appendMessageText(
+          noticeId,
+          () =>
+            res.reason === "too-short"
+              ? "Nothing to compact — the conversation is too short."
+              : "Couldn't compact the conversation — the compression request returned no summary. Try again.",
+        );
+        return;
+      }
+      const kept = chat.messages.slice(res.removedCount);
+      setProjects((ps) =>
+        ps.map((p) =>
+          p.id === selectedProjectId
+            ? {
+                ...p,
+                chats: p.chats.map((c) =>
+                  c.id === selectedChatId
+                    ? {
+                        ...c,
+                        messages: [
+                          {
+                            id: noticeId,
+                            role: "assistant",
+                            text: `Context compacted. Earlier messages were replaced by this summary:\n\n${res.summary}`,
+                            sentAt: Date.now(),
+                          },
+                          ...kept,
+                        ],
+                      }
+                    : c,
+                ),
+              }
+            : p,
+        ),
+      );
+    } catch (err) {
+      if (selectedChatIdRef.current !== chat.id) return;
+      appendMessageText(noticeId, () => `Couldn't compact the conversation: ${errMessage(err)}`);
+    } finally {
+      setTimerActive(false);
+      setSending(false);
+      sendAbortRef.current = null;
+    }
   }
 
   async function applyUndos(undos: UndoData[]) {
@@ -1512,7 +2116,13 @@ function App() {
     if (idx === -1) return;
     const removed = messages.slice(idx);
     const undos = removed
-      .flatMap((m) => (m.role === "tool" && m.status === "done" && m.undo ? [m.undo] : []))
+      .flatMap((m) =>
+        m.role === "tool" && m.status === "done" && m.undo
+          ? Array.isArray(m.undo)
+            ? m.undo
+            : [m.undo]
+          : [],
+      )
       .reverse();
     setProjects((ps) =>
       ps.map((p) =>
@@ -1541,27 +2151,39 @@ function App() {
   }
 
   async function saveEdit() {
-    const newText = editDraft.trim();
-    const messageId = editingMessageId;
+    const newText = editDraftRef.current.trim();
+    const messageId = editingMessageIdRef.current;
     if (messageId === null) return;
     setEditingMessageId(null);
     if (!newText) return;
-    const idx = messages.findIndex((m) => m.id === messageId);
-    const target = idx !== -1 ? messages[idx] : null;
+    const projectId = selectedProjectIdRef.current;
+    const chatId = selectedChatIdRef.current;
+    if (projectId === null || chatId === null) return;
+    const proj = projectsRef.current.find((p) => p.id === projectId);
+    const chat = proj?.chats.find((c) => c.id === chatId);
+    const msgs = chat?.messages ?? [];
+    const idx = msgs.findIndex((m) => m.id === messageId);
+    const target = idx !== -1 ? msgs[idx] : null;
     if (!target) return;
     if (target.role === "user") {
-      const removed = messages.slice(idx);
+      const removed = msgs.slice(idx);
       const undos = removed
-        .flatMap((m) => (m.role === "tool" && m.status === "done" && m.undo ? [m.undo] : []))
+        .flatMap((m) =>
+          m.role === "tool" && m.status === "done" && m.undo
+            ? Array.isArray(m.undo)
+              ? m.undo
+              : [m.undo]
+            : [],
+        )
         .reverse();
-      const kept = messages.slice(0, idx);
+      const kept = msgs.slice(0, idx);
       setProjects((ps) =>
         ps.map((p) =>
-          p.id === selectedProjectId
+          p.id === projectId
             ? {
                 ...p,
                 chats: p.chats.map((c) =>
-                  c.id === selectedChatId
+                  c.id === chatId
                     ? { ...c, messages: c.messages.filter((m) => !removed.some((r) => r.id === m.id)) }
                     : c,
                 ),
@@ -1571,21 +2193,21 @@ function App() {
       );
       setContextMenu(null);
       if (undos.length > 0) {
-        void applyUndos(undos);
+        void applyUndosRef.current(undos);
       }
-      if (sending) {
+      if (sendingRef.current) {
         sendAbortRef.current?.abort();
         await new Promise((r) => setTimeout(r, 0));
       }
-      await sendMessage(newText, kept, true);
+      await sendMessageRef.current(newText, kept, true);
     } else {
       setProjects((ps) =>
         ps.map((p) =>
-          p.id === selectedProjectId
+          p.id === projectId
             ? {
                 ...p,
                 chats: p.chats.map((c) =>
-                  c.id === selectedChatId
+                  c.id === chatId
                     ? {
                         ...c,
                         messages: c.messages.map((m) =>
@@ -1600,6 +2222,35 @@ function App() {
       );
     }
   }
+
+  const saveEditRef = useRef(saveEdit);
+  saveEditRef.current = saveEdit;
+  const handleEditBlur = useCallback(() => {
+    void saveEditRef.current();
+  }, []);
+  const handleEditChange = useCallback((v: string) => setEditDraft(v), []);
+  const handleEditKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        void saveEditRef.current();
+      } else if (e.key === "Escape") {
+        setEditingMessageId(null);
+      }
+    },
+    [],
+  );
+  const handleMessageContextMenu = useCallback((e: React.MouseEvent, id: number) => {
+    e.preventDefault();
+    setContextMenu({ x: e.clientX, y: e.clientY, messageId: id });
+  }, []);
+  const toggleThinking = useCallback((id: number) => {
+    thinkingToggledRef.current.add(id);
+    setExpandedThinkingId((prev) => (prev === id ? null : id));
+  }, []);
+  const toggleTool = useCallback((id: number) => {
+    setExpandedToolId((prev) => (prev === id ? null : id));
+  }, []);
 
   function saveApiKey() {
     if (keyModalProvider && keyDraft.trim()) {
@@ -1936,92 +2587,30 @@ function App() {
         {chatView ? (
           <div className="chat-view">
             <div className="chat-messages" ref={messagesRef}>
-              {messages.map((m) => (
-                <div
-                  key={m.id}
-                  className={`chat-message ${m.role === "assistant" ? "assistant" : m.role === "user" ? "user" : "tool"}`}
-                  onContextMenu={(e) => {
-                    e.preventDefault();
-                    setContextMenu({ x: e.clientX, y: e.clientY, messageId: m.id });
-                  }}
-                >
-                  {m.role === "tool" ? (
-                    <>
-                      <div className="tool-event" onClick={() => setExpandedToolId(expandedToolId === m.id ? null : m.id)}>
-                        <span className={`tool-event-icon ${m.status ?? ""}`}>
-                          {m.status === "error" ? <CloseIcon /> : <BotIcon />}
-                        </span>
-                        <span className="tool-event-name">{m.toolName}</span>
-                        <span className="tool-event-args">{truncateText(m.args ?? "", 120)}</span>
-                        <span className={`tool-event-status ${m.status ?? ""}`}>
-                          {m.status === "running" ? "running" : m.status === "error" ? "failed" : "done"}
-                        </span>
-                      </div>
-                      {m.status !== "running" && (
-                        <pre className={`tool-event-result ${expandedToolId === m.id ? "expanded" : ""}`}>
-                          {truncateText(m.result ?? "", expandedToolId === m.id ? Number.MAX_SAFE_INTEGER : RESULT_PREVIEW_LIMIT)}
-                        </pre>
-                      )}
-                    </>
-                  ) : editingMessageId === m.id ? (
-                    <textarea
-                      className="chat-message-edit"
-                      rows={2}
-                      autoFocus
-                      value={editDraft}
-                      onChange={(e) => setEditDraft(e.target.value)}
-                      onBlur={saveEdit}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && !e.shiftKey) {
-                          e.preventDefault();
-                          saveEdit();
-                        }
-                        if (e.key === "Escape") setEditingMessageId(null);
-                      }}
-                    />
-                  ) : (
-                    <>
-                      {m.role === "assistant" && m.thinking ? (
-                        <div className="thinking-block">
-                          <button
-                            className={`thinking-toggle ${expandedThinkingId === m.id ? "open" : ""}`}
-                            onClick={() => {
-                              thinkingToggledRef.current.add(m.id);
-                              setExpandedThinkingId(expandedThinkingId === m.id ? null : m.id);
-                            }}
-                          >
-                            <span className="thinking-chevron">▸</span>
-                            <span className="thinking-label">Thinking</span>
-                            {m.thinking.length > 0 && (
-                              <span className="thinking-count">
-                                {Math.max(1, Math.round(m.thinking.length / 4))} tokens
-                              </span>
-                            )}
-                          </button>
-                          {expandedThinkingId === m.id && (
-                            <div className="thinking-content">{m.thinking}</div>
-                          )}
-                        </div>
-                      ) : null}
-                      <div className="chat-message-text chat-md">
-                        <ReactMarkdown remarkPlugins={[remarkBreaks, remarkGfm]}>
-                          {m.role === "user" ? highlightMentions(m.text, mentionFiles) : m.text}
-                        </ReactMarkdown>
-                      </div>
-                      <div className="chat-message-time">
-                        {new Date(m.sentAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                      </div>
-                      {m.role === "assistant" && m.id === lastAssistantId && (sending || elapsed > 0) && (
-                        <span className={`work-indicator ${sending ? "live" : ""}`}>
-                          {sending ? "Working for " : "Worked for "}
-                          {formatElapsed(elapsed)}
-                          {sending ? "..." : ""}
-                        </span>
-                      )}
-                    </>
-                  )}
-                </div>
-              ))}
+              {messages.map((m) => {
+                const showIndicator =
+                  m.role === "assistant" && m.id === lastAssistantId && (sending || elapsed > 0);
+                return (
+                  <MessageView
+                    key={m.id}
+                    m={m}
+                    isEditing={editingMessageId === m.id}
+                    editDraft={editDraft}
+                    isThinkingExpanded={expandedThinkingId === m.id}
+                    isToolExpanded={expandedToolId === m.id}
+                    showIndicator={showIndicator}
+                    sending={showIndicator && sending}
+                    elapsed={showIndicator ? elapsed : 0}
+                    mentionFiles={mentionFiles}
+                    onContextMenu={handleMessageContextMenu}
+                    onToggleThinking={toggleThinking}
+                    onToggleTool={toggleTool}
+                    onEditChange={handleEditChange}
+                    onEditBlur={handleEditBlur}
+                    onEditKeyDown={handleEditKeyDown}
+                  />
+                );
+              })}
             </div>
             {pendingQuestions && (
               <div className="ask-panel">
@@ -2172,6 +2761,7 @@ function App() {
                 ctxUsed={ctxUsed}
                 ctxMax={selectedModel ? (ctxDetected ?? contextLengthFor(selectedModel)) : DEFAULT_CONTEXT_WINDOW}
                 mentionFiles={mentionFiles}
+                skills={skills}
                 onChange={setValue}
                 onSend={sendMessage}
                 onStop={() => sendAbortRef.current?.abort()}
@@ -2209,6 +2799,7 @@ function App() {
               ctxUsed={ctxUsed}
               ctxMax={selectedModel ? (ctxDetected ?? contextLengthFor(selectedModel)) : DEFAULT_CONTEXT_WINDOW}
               mentionFiles={mentionFiles}
+              skills={skills}
               onChange={setValue}
               onSend={sendMessage}
               onStop={() => sendAbortRef.current?.abort()}

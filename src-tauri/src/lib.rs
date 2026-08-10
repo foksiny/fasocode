@@ -1,5 +1,22 @@
 use serde_json::json;
+use std::collections::HashMap;
+use std::io::Read;
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
+use tauri::Emitter;
+
+const OUTPUT_CAP: usize = 20_000;
+
+static COMMAND_ID: AtomicU64 = AtomicU64::new(1);
+static RUNNING_COMMANDS: OnceLock<Mutex<HashMap<u64, Child>>> = OnceLock::new();
+
+fn running_commands() -> &'static Mutex<HashMap<u64, Child>> {
+    RUNNING_COMMANDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 fn resolve_in_folder(folder: &str, path: &str) -> Result<PathBuf, String> {
     let root = std::fs::canonicalize(folder).map_err(|e| format!("invalid folder: {e}"))?;
@@ -81,12 +98,72 @@ fn tool_edit(folder: &str, path: &str, old: &str, new: &str) -> Result<String, S
 }
 
 #[tauri::command]
-fn tool_run_command(command: String, folder: String, timeout: Option<u64>) -> Result<String, String> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
+async fn tool_run_command(
+    app: tauri::AppHandle,
+    command: String,
+    folder: String,
+    timeout: Option<u64>,
+    token: String,
+) -> Result<u64, String> {
+    let id = COMMAND_ID.fetch_add(1, Ordering::Relaxed);
+    thread::spawn(move || run_command_worker(app, id, command, folder, timeout, token));
+    Ok(id)
+}
 
-    let mut child = Command::new("sh")
+#[tauri::command]
+fn tool_kill_command(id: u64) -> Result<(), String> {
+    let mut map = running_commands().lock().map_err(|e| e.to_string())?;
+    if let Some(mut child) = map.remove(&id) {
+        let _ = child.kill();
+    }
+    Ok(())
+}
+
+fn run_command_worker(
+    app: tauri::AppHandle,
+    id: u64,
+    command: String,
+    folder: String,
+    timeout: Option<u64>,
+    token: String,
+) {
+    let emit_finished = |exit_code: Option<i32>,
+                         timed_out: bool,
+                         error: Option<String>,
+                         stdout: &str,
+                         stderr: &str| {
+        let mut text = String::new();
+        if let Some(code) = exit_code {
+            text.push_str(&format!("exit code: {code}\n"));
+        }
+        text.push_str(stdout);
+        if !stdout.is_empty() && !stdout.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(stderr);
+        if text.len() > OUTPUT_CAP {
+            text.truncate(text.floor_char_boundary(OUTPUT_CAP));
+            text.push_str("\n...[truncated]");
+        }
+        let _ = app.emit(
+            "tool-command-finished",
+            json!({
+                "id": id,
+                "token": token,
+                "exit_code": exit_code,
+                "timed_out": timed_out,
+                "error": error,
+                "output": text,
+            }),
+        );
+    };
+
+    if folder.trim().is_empty() {
+        emit_finished(None, false, Some("no project folder is selected".into()), "", "");
+        return;
+    }
+
+    let mut child = match Command::new("sh")
         .arg("-c")
         .arg(&command)
         .current_dir(&folder)
@@ -94,75 +171,116 @@ fn tool_run_command(command: String, folder: String, timeout: Option<u64>) -> Re
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("failed to spawn command: {e}"))?;
+    {
+        Ok(c) => c,
+        Err(e) => {
+            emit_finished(None, false, Some(format!("failed to spawn command: {e}")), "", "");
+            return;
+        }
+    };
+    let stdout = child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>);
+    let stderr = child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>);
+    running_commands().lock().unwrap().insert(id, child);
+
+    let out_handle = spawn_stream_reader(app.clone(), id, token.clone(), "stdout", stdout);
+    let err_handle = spawn_stream_reader(app.clone(), id, token.clone(), "stderr", stderr);
 
     let limit = timeout.unwrap_or(30).clamp(1, 600);
     let deadline = Instant::now() + Duration::from_secs(limit);
-
-    let stdout_thread = {
-        let out = child.stdout.take();
-        std::thread::spawn(move || {
-            let mut s = String::new();
-            if let Some(mut o) = out {
-                let _ = o.read_to_string(&mut s);
-            }
-            s
-        })
-    };
-    let stderr_thread = {
-        let err = child.stderr.take();
-        std::thread::spawn(move || {
-            let mut s = String::new();
-            if let Some(mut e) = err {
-                let _ = e.read_to_string(&mut s);
-            }
-            s
-        })
-    };
-
     let mut timed_out = false;
-    let mut exit_status = None;
-    loop {
-        match child.try_wait().map_err(|e| e.to_string())? {
-            Some(status) => {
-                exit_status = Some(status);
-                break;
+    let mut wait_error: Option<String> = None;
+    let exit_code = loop {
+        let status = {
+            let mut map = match running_commands().lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    wait_error = Some(e.to_string());
+                    break None;
+                }
+            };
+            match map.get_mut(&id) {
+                Some(c) => match c.try_wait() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        wait_error = Some(e.to_string());
+                        break None;
+                    }
+                },
+                None => break None,
             }
+        };
+        match status {
+            Some(s) => break s.code(),
             None if Instant::now() >= deadline => {
                 timed_out = true;
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
+                if let Ok(mut map) = running_commands().lock() {
+                    if let Some(c) = map.get_mut(&id) {
+                        let _ = c.kill();
+                    }
+                }
+                break None;
             }
-            None => std::thread::sleep(Duration::from_millis(50)),
+            None => thread::sleep(Duration::from_millis(50)),
         }
-    }
-    let stdout = stdout_thread.join().unwrap_or_default();
-    let stderr = stderr_thread.join().unwrap_or_default();
+    };
+    running_commands().lock().unwrap().remove(&id);
 
-    if timed_out {
-        return Err(format!("command timed out after {limit}s: {command}"));
-    }
+    let stdout_text = out_handle.join().unwrap_or_default();
+    let stderr_text = err_handle.join().unwrap_or_default();
 
-    let code = exit_status
-        .and_then(|s| s.code())
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "?".into());
-    let mut text = format!("exit code: {code}\n");
-    if !stdout.is_empty() {
-        text.push_str(&stdout);
-        if !stdout.ends_with('\n') {
-            text.push('\n');
+    if let Some(err_msg) = wait_error {
+        emit_finished(None, false, Some(err_msg), &stdout_text, &stderr_text);
+    } else if timed_out {
+        emit_finished(
+            None,
+            true,
+            Some(format!("command timed out after {limit}s: {command}")),
+            &stdout_text,
+            &stderr_text,
+        );
+    } else {
+        emit_finished(exit_code, false, None, &stdout_text, &stderr_text);
+    }
+}
+
+fn spawn_stream_reader(
+    app: tauri::AppHandle,
+    id: u64,
+    token: String,
+    stream: &'static str,
+    pipe: Option<Box<dyn Read + Send>>,
+) -> thread::JoinHandle<String> {
+    thread::spawn(move || {
+        let mut acc = String::new();
+        let Some(mut pipe) = pipe else { return acc };
+        let mut buf = [0u8; 4096];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if acc.len() >= OUTPUT_CAP {
+                        continue;
+                    }
+                    let room = OUTPUT_CAP - acc.len();
+                    let chunk = String::from_utf8_lossy(&buf[..n]);
+                    let emit_len = chunk.len().min(room);
+                    let emit = &chunk[..chunk.floor_char_boundary(emit_len)];
+                    acc.push_str(emit);
+                    let _ = app.emit(
+                        "tool-command-output",
+                        json!({
+                            "id": id,
+                            "token": token,
+                            "stream": stream,
+                            "chunk": emit,
+                        }),
+                    );
+                }
+                Err(_) => break,
+            }
         }
-    }
-    if !stderr.is_empty() {
-        text.push_str(&stderr);
-    }
-    if text.len() > 20000 {
-        text.truncate(20000);
-        text.push_str("\n...[truncated]");
-    }
-    Ok(text)
+        acc
+    })
 }
 
 #[tauri::command]
@@ -275,6 +393,7 @@ pub fn run() {
             tool_write,
             tool_edit,
             tool_run_command,
+            tool_kill_command,
             tool_search
         ])
         .run(tauri::generate_context!())

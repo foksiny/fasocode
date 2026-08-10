@@ -674,6 +674,12 @@ body,
   max-height: none;
 }
 
+.tool-event-result.streaming {
+  max-height: 300px;
+  border-color: rgba(159, 184, 159, 0.4);
+  animation: sending-pulse 1.2s ease-in-out infinite;
+}
+
 .context-menu {
   position: fixed;
   z-index: 200;
@@ -781,10 +787,10 @@ body,
 
 .reasoning-level {
   display: flex;
+  flex-wrap: wrap;
   margin-left: 10px;
   border: 2px solid #242b24;
   border-radius: 8px;
-  overflow: hidden;
   background: #101310;
 }
 

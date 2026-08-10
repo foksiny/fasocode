@@ -7,6 +7,20 @@ export type ReasoningLevel = string;
 
 export type ThinkingEffort = { value: string; label: string };
 
+const RAW_EFFORT_LABELS: Record<string, string> = {
+  none: "None",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "XHigh",
+  max: "Max",
+};
+
+function effortsFromRawValues(values: string[]): ThinkingEffort[] {
+  return values.map((v) => ({ value: v, label: RAW_EFFORT_LABELS[v] ?? v }));
+}
+
 const GENERIC_EFFORTS: ThinkingEffort[] = [
   { value: "low", label: "Low" },
   { value: "medium", label: "Medium" },
@@ -49,7 +63,9 @@ export function isReasoningModel(model: Pick<Model, "name" | "providerId">): boo
 }
 
 const KNOWN_CONTEXTS: { pattern: RegExp; contextLength: number }[] = [
-  { pattern: /gpt-5-nano|gpt-5-mini|gpt-5/i, contextLength: 272000 },
+  { pattern: /gpt-5\.6|gpt-5\.5|gpt-5\.4/i, contextLength: 1050000 },
+  { pattern: /gpt-5\.3-codex-spark/i, contextLength: 128000 },
+  { pattern: /gpt-5-nano|gpt-5-mini|gpt-5/i, contextLength: 400000 },
   { pattern: /gpt-oss/i, contextLength: 400000 },
   { pattern: /gpt-4\.1/i, contextLength: 1048576 },
   { pattern: /gpt-4o|gpt-4\.5/i, contextLength: 128000 },
@@ -58,21 +74,32 @@ const KNOWN_CONTEXTS: { pattern: RegExp; contextLength: number }[] = [
   { pattern: /gpt-4/i, contextLength: 32768 },
   { pattern: /gemini-3/i, contextLength: 1048576 },
   { pattern: /gemini/i, contextLength: 1048576 },
-  { pattern: /claude-4-5/i, contextLength: 1048576 },
+  { pattern: /claude-opus-5|claude-opus-4-6|claude-opus-4-7|claude-opus-4-8|claude-sonnet-4|claude-sonnet-4-5|claude-sonnet-4-6|claude-sonnet-5|claude-fable-5/i, contextLength: 1048576 },
+  { pattern: /claude-4-5|claude-opus-4-1/i, contextLength: 200000 },
   { pattern: /claude-4|claude-3/i, contextLength: 200000 },
   { pattern: /claude-2/i, contextLength: 100000 },
   { pattern: /llama-4/i, contextLength: 1048576 },
   { pattern: /llama-3/i, contextLength: 131072 },
+  { pattern: /deepseek-v4-flash-free/i, contextLength: 200000 },
+  { pattern: /deepseek-v4/i, contextLength: 1000000 },
   { pattern: /deepseek/i, contextLength: 128000 },
   { pattern: /qwen3/i, contextLength: 262144 },
   { pattern: /qwen2\.5/i, contextLength: 131072 },
   { pattern: /qwen2/i, contextLength: 32768 },
+  { pattern: /glm-5\.2/i, contextLength: 1048576 },
+  { pattern: /glm-4\.6|glm-4\.7|glm-5\.1|glm-5/i, contextLength: 204800 },
   { pattern: /glm-4|glm-5/i, contextLength: 128000 },
+  { pattern: /grok-4\.5|grok-5/i, contextLength: 500000 },
+  { pattern: /grok-build/i, contextLength: 256000 },
   { pattern: /grok/i, contextLength: 131072 },
+  { pattern: /minimax-m3/i, contextLength: 512000 },
+  { pattern: /minimax/i, contextLength: 204800 },
   { pattern: /mistral-large/i, contextLength: 131072 },
   { pattern: /mistral-medium/i, contextLength: 32768 },
   { pattern: /mistral-small/i, contextLength: 32768 },
   { pattern: /mixtral/i, contextLength: 65536 },
+  { pattern: /kimi-k3/i, contextLength: 1048576 },
+  { pattern: /kimi-k2/i, contextLength: 262144 },
   { pattern: /kimi/i, contextLength: 128000 },
   { pattern: /nemotron/i, contextLength: 131072 },
   { pattern: /command-r\+|command-a/i, contextLength: 131072 },
@@ -169,6 +196,161 @@ function effortsForModel(providerId: string, modelName: string): ThinkingEffort[
   return isReasoningModel({ providerId, name: modelName }) ? effortsFor(providerId, modelName) : null;
 }
 
+// Live model registry (models.dev) that tracks real context windows and raw reasoning options across
+// providers. The OpenAI-style /v1/models endpoints of openai/opencode-zen expose only {id, object,
+// created, owned_by} today, so this registry is the source of truth for their context windows and the
+// exact `reasoning_effort` values each model accepts; it is fetched once per session and cached.
+const MODELSDEV_PROVIDER: Record<string, string> = {
+  openai: "openai",
+  "opencode-zen": "opencode",
+  google: "google",
+};
+
+type ModelsDevRegistry = {
+  context: Record<string, Record<string, number>>;
+  options: Record<string, Record<string, ModelsDevEntry>>;
+};
+
+type ModelsDevEntry = {
+  reasoning?: string[];
+  budget?: { min: number; max: number };
+};
+
+let modelsDevCache: Promise<ModelsDevRegistry | null> | null = null;
+
+type ModelsDevModelMeta = {
+  limit?: { context?: number };
+  reasoning_options?: {
+    type?: string;
+    values?: string[];
+    min?: number;
+    max?: number;
+  }[];
+};
+
+function fetchModelsDevRegistry(): Promise<ModelsDevRegistry | null> {
+  if (!modelsDevCache) {
+    modelsDevCache = (async () => {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 12000);
+        const res = await fetch("https://models.dev/api.json", { signal: controller.signal });
+        clearTimeout(timer);
+        if (!res.ok) return null;
+        const data = (await res.json()) as Record<string, { models?: Record<string, ModelsDevModelMeta> }>;
+        const out: ModelsDevRegistry = { context: {}, options: {} };
+        for (const [provider, providerData] of Object.entries(data)) {
+          const ctxMap: Record<string, number> = {};
+          const optMap: Record<string, ModelsDevEntry> = {};
+          for (const [id, model] of Object.entries(providerData.models ?? {})) {
+            const ctx = model.limit?.context;
+            if (typeof ctx === "number" && ctx > 0) ctxMap[id.toLowerCase()] = ctx;
+            const options = model.reasoning_options ?? [];
+            const entry: ModelsDevEntry = {};
+            const effort = options.find((r) => Array.isArray(r.values) && r.values.length > 0);
+            if (effort) entry.reasoning = effort.values!;
+            const budget = options.find(
+              (r) => r.type === "budget_tokens" && typeof r.min === "number" && typeof r.max === "number",
+            );
+            if (budget) entry.budget = { min: budget.min!, max: budget.max! };
+            if (entry.reasoning || entry.budget) optMap[id.toLowerCase()] = entry;
+          }
+          out.context[provider] = ctxMap;
+          out.options[provider] = optMap;
+        }
+        return out;
+      } catch {
+        return null;
+      }
+    })();
+  }
+  return modelsDevCache;
+}
+
+function registryLookup(
+  registry: ModelsDevRegistry | null,
+  providerKey: string,
+  modelName: string,
+): ModelsDevEntry | null {
+  if (!registry) return null;
+  const map = registry.options[providerKey];
+  if (!map) return null;
+  const id = modelName.toLowerCase();
+  if (map[id]) return map[id];
+  const prefixMatch = Object.keys(map).find((k) => k.startsWith(`${id}-`));
+  if (prefixMatch) return map[prefixMatch];
+  const suffixMatch = Object.keys(map).find((k) => id.startsWith(`${k}-`));
+  return suffixMatch ? map[suffixMatch] : null;
+}
+
+function registryHasModel(registry: ModelsDevRegistry, providerKey: string, modelName: string): boolean {
+  const id = modelName.toLowerCase();
+  return (
+    id in (registry.options[providerKey] ?? {}) || id in (registry.context[providerKey] ?? {})
+  );
+}
+
+// Models confirmed (via the live registry) to expose a thinking/reasoning mode are cached here so
+// per-turn requests can pass their `reasoning_effort` value through without a network round trip.
+const reasoningModelCache = new Set<string>();
+
+function budgetEfforts(budget: { min: number; max: number }): ThinkingEffort[] {
+  const max = Math.max(budget.max, 1);
+  const tiers = [Math.max(budget.min, Math.round(max * 0.25)), Math.max(budget.min, Math.round(max * 0.5)), max];
+  const labels = ["Low", "Medium", "High"];
+  return [...new Set(tiers)].map((v, i) => ({ value: String(v), label: labels[i] ?? "High" }));
+}
+
+function modelsEndpointFor(providerId: string): string | null {
+  switch (providerId) {
+    case "openai":
+      return "https://api.openai.com/v1/models";
+    case "opencode-zen":
+      return "https://opencode.ai/zen/v1/models";
+    default:
+      return null;
+  }
+}
+
+const CONTEXT_FIELD_KEYS = [
+  "context_window",
+  "context_length",
+  "max_model_len",
+  "max_context_length",
+  "input_token_limit",
+  "inputTokenLimit",
+];
+
+async function contextFromModelsEndpoint(
+  providerId: string,
+  apiKey: string,
+  modelName: string,
+): Promise<number | null> {
+  const endpoint = modelsEndpointFor(providerId);
+  if (!endpoint) return null;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    const res = await fetch(endpoint, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const list: Record<string, unknown>[] = Array.isArray(data?.data) ? data.data : [];
+    const model = list.find((m) => m.id === modelName) as Record<string, unknown> | undefined;
+    if (!model) return null;
+    for (const key of CONTEXT_FIELD_KEYS) {
+      const raw = model[key];
+      if (typeof raw === "number" && raw > 0) return raw;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export async function fetchModelCapabilities(
   providerId: string,
   apiKey: string,
@@ -187,12 +369,16 @@ export async function fetchModelCapabilities(
     } else {
       efforts = effortsForModel(providerId, modelName);
     }
+    if (efforts) reasoningModelCache.add(`${providerId}/${modelName.toLowerCase()}`);
     const contextLength =
       typeof model?.context_length === "number" && model.context_length > 0
         ? model.context_length
         : contextLengthFromName(modelName);
     return { efforts, contextLength };
   }
+
+  const registryKey = MODELSDEV_PROVIDER[providerId];
+  const registryPromise = registryKey ? fetchModelsDevRegistry() : Promise.resolve(null);
 
   let contextLength: number | null = null;
   if (providerId === "google") {
@@ -222,6 +408,10 @@ export async function fetchModelCapabilities(
     } catch {
       // metadata unavailable; fall back below
     }
+    if (contextLength === null) {
+      const registry = await registryPromise;
+      contextLength = registry?.context[registryKey!]?.[modelName.toLowerCase()] ?? null;
+    }
   } else if (providerId === "nvidia-nim") {
     try {
       const controller = new AbortController();
@@ -248,9 +438,40 @@ export async function fetchModelCapabilities(
     } catch {
       // metadata unavailable; fall back below
     }
+    if (contextLength === null) contextLength = nimCatalogContext(modelName);
+  } else if (providerId === "openai" || providerId === "opencode-zen") {
+    const [fromEndpoint, registry] = await Promise.all([
+      contextFromModelsEndpoint(providerId, apiKey, modelName),
+      registryPromise,
+    ]);
+    contextLength = fromEndpoint ?? registry?.context[registryKey!]?.[modelName.toLowerCase()] ?? null;
   }
-  if (contextLength === null) contextLength = nimCatalogContext(modelName) ?? contextLengthFromName(modelName);
-  return { efforts: effortsFor(providerId, modelName), contextLength };
+  if (contextLength === null) contextLength = contextLengthFromName(modelName);
+
+  const registry = registryKey ? await registryPromise : null;
+  let efforts: ThinkingEffort[] | null;
+  if (registryKey && registry) {
+    const entry = registryLookup(registry, registryKey, modelName);
+    if (entry?.reasoning) {
+      efforts = effortsFromRawValues(entry.reasoning);
+    } else if (registryHasModel(registry, registryKey, modelName)) {
+      // Known to the registry but it reports no named reasoning efforts: no thinking mode, unless
+      // the provider still exposes one (Gemini 2.x exposes a numeric thinking budget instead).
+      if (providerId === "google" && entry?.budget) {
+        efforts = budgetEfforts(entry.budget);
+      } else if (providerId === "google" && isReasoningModel({ providerId, name: modelName })) {
+        efforts = effortsFor(providerId, modelName);
+      } else {
+        efforts = null;
+      }
+    } else {
+      efforts = effortsForModel(providerId, modelName);
+    }
+  } else {
+    efforts = effortsForModel(providerId, modelName);
+  }
+  if (efforts) reasoningModelCache.add(`${providerId}/${modelName.toLowerCase()}`);
+  return { efforts, contextLength };
 }
 
 export async function fetchThinkingEfforts(
@@ -262,7 +483,9 @@ export async function fetchThinkingEfforts(
 }
 
 function reasoningLevelFor(model: Model, level: ReasoningLevel | undefined): ReasoningLevel | undefined {
-  if (!level || !isReasoningModel(model)) return undefined;
+  if (!level) return undefined;
+  const known = reasoningModelCache.has(`${model.providerId}/${model.name.toLowerCase()}`);
+  if (!known && !isReasoningModel(model)) return undefined;
   return level;
 }
 
@@ -512,6 +735,42 @@ const TOOLS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "hypertool",
+      description:
+        "Execute a sequence of other tool calls as a SINGLE tool call. `steps` is an array of {name, args} where each step is one normal tool from this list — for example, to create three files at once: " +
+        "steps = [{name: 'write', args: {path: 'a.py', content: '...'}}, {name: 'write', args: {path: 'b.py', content: '...'}}]. " +
+        "Steps run strictly in order; the result of EVERY step is returned together with its step number, so you can batch multiple writes, edits, reads, searches, or quick commands into one call and act on all results at once. " +
+        "Use it whenever several independent tool calls share a goal — it counts as ONE tool call, which is far more economical than calling tools one by one. " +
+        "Rules: never nest hypertool inside hypertool; never include ask_user (it needs interactive answers). " +
+        "If stop_on_error is true (default), the sequence aborts at the first failing step and the error is thrown; if false, every step runs and failures are reported inline.",
+      parameters: {
+        type: "object",
+        properties: {
+          steps: {
+            type: "array",
+            minItems: 1,
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string", description: "Tool name to run (e.g. read, write, replace, search, run_command)" },
+                args: { type: "object", description: "Arguments object for that tool" },
+              },
+              required: ["name", "args"],
+            },
+            description: "The tool calls to run, in order",
+          },
+          stop_on_error: {
+            type: "boolean",
+            description: "Abort at the first failing step (default true)",
+          },
+        },
+        required: ["steps"],
+      },
+    },
+  },
 ];
 
 type OpenAIMessage = {
@@ -584,6 +843,7 @@ function systemPromptFor(projectName: string, folder: string | null): string {
     "- list_files(path?, extensions?): recursively list project files in one call (directories end with /). Use it to discover the project structure instead of guessing paths.",
     "- fetch_url(url): fetch a web page's text content. Use it for documentation or reference lookups; prefer official docs and avoid unnecessary fetches.",
     "- ask_user(questions): ask the user one or more structured questions and wait for their answers. Each question has a type: choice (pick one of options), toggle (turn any subset of options on), confirm (yes/no), input (free text), or mix (a structured choice with an extra input field at the end for notes). Use this any time you need clarification, a decision, or confirmation — never guess when the user could decide in one click. Batch related questions into a single call when possible.",
+    "- hypertool(steps, stop_on_error?): execute a SEQUENCE of tool calls as a single tool call. steps is an array of {name, args} (e.g. write several files, read several files, or any mix of read/write/replace/search/run_command/...). Steps run in order and every result is returned with its step number, so one hypertool call replaces many ordinary calls — this is your batching hammer. Never nest hypertool, never include ask_user.",
     "Tool results are appended to the conversation automatically and displayed in the UI, so do not repeat them back verbatim in your replies.",
     "",
     "## Slash commands",
@@ -593,6 +853,7 @@ function systemPromptFor(projectName: string, folder: string | null): string {
     "- /explain <topic>: explain the topic clearly and thoroughly, in plain language, with concrete references to the project where relevant.",
     "- /review [focus]: review the recent work in the project carefully (bugs, edge cases, style, risks), suggest concrete fixes, and do not modify files.",
     "- /tests [target]: generate tests for the target/ recent work and run them; report results and fix failures when reasonable.",
+    "- /skill <name>: the user has FORCE-LOADED a saved skill; its full content appears earlier in the conversation as a FORCED SKILL message. Treat it as mandatory instructions for this message's task. If the skill could not be matched, a listing of available skills is injected instead — tell the user which skill matches best or ask them to pick one.",
     "",
     "## ToDo lists",
     "For any multi-step task, maintain a ToDo list with the todo tool: create it when you start executing, update statuses as you progress, and mark tasks done as they complete. The list is displayed to the user, so it should stay accurate and reflect reality — do not mark work done before it is actually done.",
@@ -613,7 +874,7 @@ function systemPromptFor(projectName: string, folder: string | null): string {
     "   - Timing: am I calling this now because I need it now, or just in case? Defer speculative calls.",
     "   - Payoff: will the result change what I do next? If not, the call is decorative — skip it.",
     "3. Plan before motion: form an explicit minimum plan before your first tool call on any non-trivial task; identify up front which unknowns actually block progress versus which are merely interesting; default to the most information-dense single action (a whole-directory read instead of file-by-file calls) before falling back to iterative narrowing; solve deterministically wherever possible instead of using a tool call to confirm what you already know. Never treat 'gather more context' as a default first move.",
-    "4. Batch and parallelize: combine independent lookups into the fewest possible calls; write full files in one write instead of sequences of incremental edits; a single composite payload beats several small writes to the same target.",
+    "4. Batch and parallelize: combine independent lookups into the fewest possible calls; write full files in one write instead of sequences of incremental edits; a single composite payload beats several small writes to the same target. Whenever several ordinary tool calls are heading toward the same goal, pack them into ONE hypertool call (multiple writes, reads, edits, searches — any mix) and get every result back in a single step. One hypertool call always beats a loop of single calls.",
     "5. Eliminate redundancy: treat what you've already learned as ground truth until something concretely invalidates it; never re-read a file or re-run a search you already have the answer from unless the underlying state could plausibly have changed since; do not verify a successful write with a read-back — the tool result already confirmed it.",
     "6. Definition of done: the user's actual goal — not merely the literal request — is satisfied; the output is produced in a form the user can immediately use; no open thread remains that you have both the ability and the mandate to close. Once this bar is met: stop. Do not keep working to 'be thorough'; padding a finished task with extra confirmatory calls is the same failure mode as under-researching, it just fails quieter.",
     "7. Spend calls generously ONLY on: irreversible or destructive actions (verify before committing, every time), genuine ambiguity that changes the deliverable (one targeted check or clarifying question is cheaper than doing the wrong thing well), high-stakes correctness (security, financial, safety-critical code), and volatile or time-sensitive facts.",
@@ -639,6 +900,21 @@ function systemPromptFor(projectName: string, folder: string | null): string {
     "",
     "## Tone",
     "Work decisively and quietly. Never narrate your reasoning or your economizing ('I'll avoid an extra call here by...') — just operate this way by default. The user should experience you as someone who gets to the right answer fast. Write concise, useful replies.",
+    "",
+    "## Output shape: the reader has ADHD",
+    "The reader has ADHD. Every reply — not just some — is shaped so an ADHD brain can act on it. Working memory is small, starting is the hardest step, vague time estimates fail, and hidden progress doesn't register. These rules are always on:",
+    "1. Lead with the next action. The first line is something the user can do: a command, a path, a snippet. Prose comes after, if at all. Never open with context, a plan, 'Let me...', 'I'll...', 'Sure!', or praise.",
+    "2. Number multi-step work. Each step is one bounded action, no 'and then' chains. Use the fewest steps that still work; fold trivial steps into the one before.",
+    "3. End with one concrete next action, doable in under two minutes, whenever anything is left open. Even 'open the file' counts.",
+    "4. Suppress tangents. Finish the first thing, then offer the second as a separate question — never as a mid-reply 'by the way'.",
+    "5. Restate state every turn. The user cannot hold 'step 3 of 5' between messages — say it. For multi-step work the todo tool does the restating (one item per step, one in progress); do not also narrate the full plan as prose.",
+    "6. Give specific time estimates in concrete units ('about 15 minutes', 'an afternoon if tests don't cover it'), never vague ('a bit of work'). For work you execute yourself, estimate in terms of when the user sees the result.",
+    "7. Make completed work visible. Show what now works, concretely ('Login now works with magic links. Try: npm run dev, open /login') instead of burying wins in a recap.",
+    "8. Errors are matter-of-fact: state the cause and the fix. Never 'Uh oh' or 'there seems to be a problem'.",
+    "9. Cap lists at 5 items. A longer list splits into 'do now' vs 'later' or 'must' vs 'nice to have'. Five ranked items beat ten unranked.",
+    "10. No preamble, no recap after completion, no closing pleasantries ('Let me know if you need anything else', 'Hope this helps', 'Feel free to ask'). Start with the answer. End when the answer is done.",
+    "Break these rules when: the user asks you to explain or walk them through something (explain fully, add headers to skim back, but still no preamble or closer); a destructive action is ahead (confirm before acting — safety beats brevity); the last three turns have been 'still broken' (stop iterating, name the assumption that may be wrong, ask one diagnostic question); the request is genuinely ambiguous (one short question beats guessing); or a rule would delete the answer itself (the task wins, the shape stays).",
+    "Before sending: delete any sentence that announces what you are about to do, any closing recap or 'anything else?', any 'by the way' sidebar, and any hedges or idioms that add no information. Then verify: if the user reads only the first line and the last line, do they know what to do next and what just happened? If not, rewrite.",
   ].join("\n");
 }
 
@@ -770,6 +1046,7 @@ async function requestTurnOpenAI(
   isNim: boolean,
   onText: (delta: string) => void,
   onThinking: (delta: string) => void,
+  includeTools = true,
   signal?: AbortSignal,
 ): Promise<TurnResult> {
   const res = await fetch(url, {
@@ -782,8 +1059,7 @@ async function requestTurnOpenAI(
       model: modelName,
       stream: true,
       messages: [{ role: "system", content: systemPrompt }, ...messages],
-      tools: TOOLS,
-      tool_choice: "auto",
+      ...(includeTools ? { tools: TOOLS, tool_choice: "auto" } : {}),
       ...(reasoningLevel ? { reasoning_effort: reasoningLevel } : {}),
       ...(isNim && reasoningLevel ? { chat_template_kwargs: { thinking: true } } : {}),
     }),
@@ -901,9 +1177,16 @@ async function requestTurnOpenAI(
 }
 
 function geminiThinkingBudget(level: ReasoningLevel): number {
+  const numeric = Number(level);
+  if (Number.isInteger(numeric)) return numeric;
   switch (level) {
+    case "none":
+      return 0;
+    case "minimal":
     case "low":
       return 1024;
+    case "xhigh":
+    case "max":
     case "high":
       return 32768;
     default:
@@ -918,6 +1201,7 @@ async function requestTurnGemini(
   reasoningLevel: ReasoningLevel | undefined,
   onText: (delta: string) => void,
   onThinking: (delta: string) => void,
+  includeTools = true,
   signal?: AbortSignal,
 ): Promise<TurnResult> {
   const functionDeclarations = TOOLS.map((t) => ({
@@ -931,7 +1215,7 @@ async function requestTurnGemini(
     body: JSON.stringify({
       system_instruction: { parts: [{ text: systemPrompt }] },
       contents: toGeminiContents(messages),
-      tools: [{ functionDeclarations }],
+      ...(includeTools ? { tools: [{ functionDeclarations }] } : {}),
       ...(reasoningLevel
         ? {
             generationConfig: {
@@ -1035,6 +1319,73 @@ async function requestTurnGemini(
   };
 }
 
+async function requestCompression(
+  providerId: string,
+  modelName: string,
+  apiKey: string,
+  messages: OpenAIMessage[],
+  signal?: AbortSignal,
+): Promise<string> {
+  const url = endpointFor(providerId, modelName);
+  const isGemini = providerId === "google";
+  const isNim = providerId === "nvidia-nim";
+  const summaryPrompt = [
+    "You are a conversation compression engine for an autonomous coding agent. Compress the conversation below into a concise but complete summary that preserves:",
+    "- the user's objective and all requirements, preferences and constraints stated so far",
+    "- the current task state: what has already been done, what is in progress, and exactly what remains to do",
+    "- every important fact, decision and conclusion reached",
+    "- all tool results that matter (file paths, content snippets, command outputs, errors)",
+    "- any outstanding work, open questions and next steps",
+    "Keep file paths, code and error messages verbatim where possible. The summary replaces the earlier messages, so the agent must be able to continue the task from it alone. Output ONLY the summary, no preamble.",
+    "Target length: around 800-1500 tokens.",
+  ].join("\n");
+  let summary = "";
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60000);
+    const onMainAbort = () => controller.abort();
+    if (signal?.aborted) controller.abort();
+    else signal?.addEventListener("abort", onMainAbort, { once: true });
+    const turn = isGemini
+      ? await requestTurnGemini(url, apiKey, messages, summaryPrompt, undefined, (d) => { summary += d; }, () => {}, false, controller.signal)
+      : await requestTurnOpenAI(url, apiKey, modelName, messages, summaryPrompt, undefined, isNim, (d) => { summary += d; }, () => {}, false, controller.signal);
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", onMainAbort);
+    if (typeof turn.assistantMessage.content === "string" && turn.assistantMessage.content.trim()) {
+      summary = turn.assistantMessage.content.trim();
+    }
+  } catch {
+    summary = "";
+  }
+  return summary;
+}
+
+export type CompactionMessage = { role: "user" | "assistant" | "tool"; text: string };
+
+export type CompactionResult =
+  | { summary: string; removedCount: number }
+  | { summary: null; removedCount: null; reason: "too-short" | "failed" };
+
+export async function compactConversation(params: {
+  providerId: string;
+  modelName: string;
+  apiKey: string;
+  messages: CompactionMessage[];
+  signal?: AbortSignal;
+}): Promise<CompactionResult> {
+  const { providerId, modelName, apiKey, messages, signal } = params;
+  if (messages.length <= COMPRESS_KEEP_MESSAGES) return { summary: null, removedCount: null, reason: "too-short" };
+  const removedCount = messages.length - COMPRESS_KEEP_MESSAGES;
+  const input: OpenAIMessage[] = messages.slice(0, removedCount).map((m) =>
+    m.role === "tool"
+      ? { role: "user", content: `[Tool result]\n${m.text}` }
+      : { role: m.role, content: m.text },
+  );
+  const summary = await requestCompression(providerId, modelName, apiKey, input, signal);
+  if (!summary) return { summary: null, removedCount: null, reason: "failed" };
+  return { summary, removedCount };
+}
+
 export async function runAgenticLoop(
   params: {
     model: Model;
@@ -1066,53 +1417,39 @@ export async function runAgenticLoop(
     return total;
   }
 
-  async function compressContext(): Promise<string> {
-    const summaryPrompt = [
-      "You are a conversation compression engine. Compress the conversation below into a concise but complete summary that preserves:",
-      "- the user's objective and all requirements, preferences and constraints stated so far",
-      "- every important fact, decision and conclusion reached",
-      "- all tool results that matter (file paths, content snippets, command outputs, errors)",
-      "- any outstanding work, open questions and next steps",
-      "Keep file paths, code and error messages verbatim where possible. Output ONLY the summary, no preamble.",
-      "Target length: around 800-1500 tokens.",
-    ].join("\n");
-    let summary = "";
+  let compacting = false;
+
+  async function maybeCompact(): Promise<void> {
+    if (compacting) return;
+    if (historyMsgs.length <= COMPRESS_KEEP_MESSAGES) return;
+    if (payloadTokens() <= contextLength * COMPRESS_THRESHOLD) return;
+    const snapshotCount = historyMsgs.length - COMPRESS_KEEP_MESSAGES;
+    const snapshot = historyMsgs.slice(0, snapshotCount);
+    compacting = true;
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 60000);
-      const turn = isGemini
-        ? await requestTurnGemini(url, apiKey, historyMsgs, summaryPrompt, undefined, (d) => { summary += d; }, () => {}, controller.signal)
-        : await requestTurnOpenAI(url, apiKey, model.name, historyMsgs, summaryPrompt, undefined, isNim, (d) => { summary += d; }, () => {}, controller.signal);
-      clearTimeout(timeout);
-      if (typeof turn.assistantMessage.content === "string" && turn.assistantMessage.content.trim()) {
-        summary = turn.assistantMessage.content.trim();
-      }
-    } catch {
-      summary = "";
-    }
-    if (summary) {
-      const kept = historyMsgs.slice(-COMPRESS_KEEP_MESSAGES);
+      const summary = await requestCompression(model.providerId, model.name, apiKey, snapshot, signal);
+      if (signal?.aborted) return;
+      const kept = historyMsgs.slice(snapshotCount);
       historyMsgs.splice(0, historyMsgs.length);
-      historyMsgs.push({
-        role: "user",
-        content: "Earlier in this conversation (compressed into a summary):\n\n" + summary,
-      });
+      if (summary) {
+        historyMsgs.push({
+          role: "user",
+          content: "Earlier in this conversation (compressed into a summary):\n\n" + summary,
+        });
+      }
       historyMsgs.push(...kept);
-    } else {
-      historyMsgs.splice(0, Math.max(0, historyMsgs.length - COMPRESS_KEEP_MESSAGES));
+      cbs.onCompress?.(summary);
+    } finally {
+      compacting = false;
     }
-    return summary;
   }
 
   for (;;) {
-    if (historyMsgs.length > COMPRESS_KEEP_MESSAGES && payloadTokens() > contextLength * COMPRESS_THRESHOLD) {
-      const summary = await compressContext();
-      cbs.onCompress?.(summary);
-    }
+    await maybeCompact();
     cbs.onTurnStart();
     const turn = isGemini
-      ? await requestTurnGemini(url, apiKey, historyMsgs, systemPrompt, reasoningLevel, cbs.onText, cbs.onThinking ?? (() => {}), signal)
-      : await requestTurnOpenAI(url, apiKey, model.name, historyMsgs, systemPrompt, reasoningLevel, isNim, cbs.onText, cbs.onThinking ?? (() => {}), signal);
+      ? await requestTurnGemini(url, apiKey, historyMsgs, systemPrompt, reasoningLevel, cbs.onText, cbs.onThinking ?? (() => {}), true, signal)
+      : await requestTurnOpenAI(url, apiKey, model.name, historyMsgs, systemPrompt, reasoningLevel, isNim, cbs.onText, cbs.onThinking ?? (() => {}), true, signal);
 
     historyMsgs.push(turn.assistantMessage);
     if (!turn.toolCalls.length) return;
@@ -1128,6 +1465,7 @@ export async function runAgenticLoop(
         cbs.onToolError(call, result);
       }
       historyMsgs.push({ role: "tool", tool_call_id: call.id, name: call.name, content: result });
+      await maybeCompact();
     }
   }
 }
