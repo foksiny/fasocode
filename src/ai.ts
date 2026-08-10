@@ -499,6 +499,7 @@ export type AgentCallbacks = {
   onToolDone: (call: ToolCall, result: string) => void;
   onToolError: (call: ToolCall, error: string) => void;
   onCompress?: (summary: string | null) => void;
+  onAgentsCollected?: (summary: string) => void;
 };
 
 const TOOLS = [
@@ -744,7 +745,7 @@ const TOOLS = [
         "steps = [{name: 'write', args: {path: 'a.py', content: '...'}}, {name: 'write', args: {path: 'b.py', content: '...'}}]. " +
         "Steps run strictly in order; the result of EVERY step is returned together with its step number, so you can batch multiple writes, edits, reads, searches, or quick commands into one call and act on all results at once. " +
         "Use it whenever several independent tool calls share a goal — it counts as ONE tool call, which is far more economical than calling tools one by one. " +
-        "Rules: never nest hypertool inside hypertool; never include ask_user (it needs interactive answers). " +
+        "Rules: never nest hypertool inside hypertool; never include ask_user (it needs interactive answers); never include spawn_agents or collect_agents (agents cannot be nested inside other tools). " +
         "If stop_on_error is true (default), the sequence aborts at the first failing step and the error is thrown; if false, every step runs and failures are reported inline.",
       parameters: {
         type: "object",
@@ -768,6 +769,64 @@ const TOOLS = [
           },
         },
         required: ["steps"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "spawn_agents",
+      description:
+        "Delegate independent work to one or more background sub-agents that run CONCURRENTLY. Each sub-agent is a full autonomous agent with the same tools, except it cannot ask the user questions and cannot spawn further agents. " +
+        "With wait=false (default) this returns immediately with the agent ids and they keep working asynchronously in the background while you do other work; retrieve their summaries later with collect_agents. " +
+        "With wait=true it blocks until every agent finishes and returns all summaries at once (use for a parallel batch whose results you need before doing anything else). " +
+        "Use it for genuinely independent chunks of work (separate files or features, separate research lookups, generating tests while you refactor). " +
+        "Do NOT use it when the pieces depend on each other's output, when two agents would edit the same file (they will conflict), when the work needs user input, or for small tasks you can just do yourself. " +
+        "Give each agent a self-contained task: the goal, the exact files it owns, deliverables, and how to verify.",
+      parameters: {
+        type: "object",
+        properties: {
+          agents: {
+            type: "array",
+            minItems: 1,
+            maxItems: 6,
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "string", description: "Short unique id for this agent (e.g. 'a1', 'tests')" },
+                name: { type: "string", description: "Short display label (e.g. 'tests agent', 'feature-a')" },
+                task: { type: "string", description: "Fully self-contained task: goal, exact files this agent owns, deliverables, and how to verify" },
+              },
+              required: ["id", "name", "task"],
+            },
+            description: "The agents to spawn",
+          },
+          wait: {
+            type: "boolean",
+            description: "If true, block until every agent finishes and return all results at once (default false: return immediately, collect later with collect_agents)",
+          },
+        },
+        required: ["agents"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "collect_agents",
+      description:
+        "Wait for background sub-agents (spawned with spawn_agents) to finish and return their results. Call it before ending your turn so you can incorporate the agents' work into your reply. " +
+        "If some agents are still running when the timeout expires, they are reported as running — call again, or end your turn and their results will be collected and handed back to you automatically.",
+      parameters: {
+        type: "object",
+        properties: {
+          ids: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional: only wait for these agent ids (default: all agents spawned this turn)",
+          },
+          timeout: { type: "integer", description: "Seconds to wait (default 120, max 600)" },
+        },
       },
     },
   },
@@ -879,6 +938,14 @@ function systemPromptFor(projectName: string, folder: string | null): string {
     "6. Definition of done: the user's actual goal — not merely the literal request — is satisfied; the output is produced in a form the user can immediately use; no open thread remains that you have both the ability and the mandate to close. Once this bar is met: stop. Do not keep working to 'be thorough'; padding a finished task with extra confirmatory calls is the same failure mode as under-researching, it just fails quieter.",
     "7. Spend calls generously ONLY on: irreversible or destructive actions (verify before committing, every time), genuine ambiguity that changes the deliverable (one targeted check or clarifying question is cheaper than doing the wrong thing well), high-stakes correctness (security, financial, safety-critical code), and volatile or time-sensitive facts.",
     "8. Anti-patterns (never do these): searching or reading 'to be safe' when you already have a confident, groundable answer; re-reading the same file without new cause; splitting a batchable operation into a loop of single-item calls; performing a broad exploratory sweep before forming a hypothesis; verifying your own successful action with a second read-back; continuing to act after the definition of done has been met; asking the user for information that one tool call could resolve; making a tool call as a substitute for thinking.",
+    "",
+    "## Parallel agents (spawn_agents / collect_agents)",
+    "You can delegate independent work to background sub-agents. Each sub-agent is a full autonomous agent with the same tools, except it cannot ask the user questions and cannot spawn more agents.",
+    "- spawn_agents(agents, wait?): agents is [{id, name, task}], 1-4 recommended (max 6). Each agent runs concurrently. With wait=false (default) it returns immediately and the agents keep working in the background while you continue your own work; with wait=true it blocks and returns every agent's summary at once — use that for a parallel batch whose results you need before doing anything else.",
+    "- collect_agents(ids?, timeout?): blocks until the listed agents finish (default 120s, max 600s) and returns their summaries. Call it before ending your turn so you can incorporate the results into your final reply. If any agents are still running when your turn ends, their results are collected automatically, handed back to you as a message, and your turn continues — you never have to wait idle.",
+    "USE agents when: several chunks of work are genuinely independent (features in different files, separate research lookups, generating tests while you refactor, parallel experiments), AND the work is big enough to justify the overhead of an agent (roughly: more than a few tool calls).",
+    "DO NOT use agents when: the pieces depend on each other's output (do them yourself, in order); two agents would edit the same file (they will conflict — only delegate files that a single agent owns); the work needs user input; the task is a single small edit (just do it); or the work is trivial. Delegating poorly is worse than not delegating: if you cannot write each task as a fully self-contained brief, do the work yourself.",
+    "Give each agent a self-contained task: the goal, the exact files it owns, deliverables, and how to verify. Prefer few agents over many; keep the agent count modest (1-4).",
     "",
     "## Plans are reviewed by the user",
     "- For any task beyond a single obvious edit: do NOT start executing immediately. First reply with a big, highly detailed plan in Markdown — the exact files to create or modify, the content outline, the commands to run, and the verification steps — then STOP (no tool calls) so the user can review it.",
@@ -1386,6 +1453,15 @@ export async function compactConversation(params: {
   return { summary, removedCount };
 }
 
+const EMPTY_BANNED_TOOLS: ReadonlySet<string> = new Set();
+
+export type AgentLoopOptions = {
+  systemPrompt?: string;
+  bannedTools?: ReadonlySet<string>;
+  maxTurns?: number;
+  collectPendingAgents?: () => Promise<string | null>;
+};
+
 export async function runAgenticLoop(
   params: {
     model: Model;
@@ -1398,11 +1474,15 @@ export async function runAgenticLoop(
   },
   runTool: (name: string, args: Record<string, unknown>) => Promise<string>,
   cbs: AgentCallbacks,
+  opts?: AgentLoopOptions,
   signal?: AbortSignal,
 ): Promise<void> {
   const { model, apiKey, projectName, folder, history } = params;
   const contextLength = params.contextLength ?? DEFAULT_CONTEXT_WINDOW;
-  const systemPrompt = systemPromptFor(projectName, folder);
+  const systemPrompt = opts?.systemPrompt ?? systemPromptFor(projectName, folder);
+  const bannedTools = opts?.bannedTools ?? EMPTY_BANNED_TOOLS;
+  const maxTurns = opts?.maxTurns ?? Number.MAX_SAFE_INTEGER;
+  let turns = 0;
   const isGemini = model.providerId === "google";
   const url = endpointFor(model.providerId, model.name);
   const reasoningLevel = reasoningLevelFor(model, params.reasoningLevel);
@@ -1418,6 +1498,17 @@ export async function runAgenticLoop(
   }
 
   let compacting = false;
+
+  const collectPendingAgents = opts?.collectPendingAgents;
+
+  async function finishTurn(): Promise<boolean> {
+    if (!collectPendingAgents) return false;
+    const msg = await collectPendingAgents();
+    if (msg === null || signal?.aborted) return false;
+    historyMsgs.push({ role: "user", content: msg });
+    cbs.onAgentsCollected?.(msg);
+    return true;
+  }
 
   async function maybeCompact(): Promise<void> {
     if (compacting) return;
@@ -1452,9 +1543,18 @@ export async function runAgenticLoop(
       : await requestTurnOpenAI(url, apiKey, model.name, historyMsgs, systemPrompt, reasoningLevel, isNim, cbs.onText, cbs.onThinking ?? (() => {}), true, signal);
 
     historyMsgs.push(turn.assistantMessage);
-    if (!turn.toolCalls.length) return;
+    if (!turn.toolCalls.length) {
+      if (await finishTurn()) continue;
+      return;
+    }
 
     for (const call of turn.toolCalls) {
+      if (bannedTools.has(call.name)) {
+        const err = `Error: ${call.name} is not available here.`;
+        historyMsgs.push({ role: "tool", tool_call_id: call.id, name: call.name, content: err });
+        cbs.onToolError(call, err);
+        continue;
+      }
       cbs.onToolStart(call);
       let result: string;
       try {
@@ -1467,5 +1567,98 @@ export async function runAgenticLoop(
       historyMsgs.push({ role: "tool", tool_call_id: call.id, name: call.name, content: result });
       await maybeCompact();
     }
+    turns += 1;
+    if (turns >= maxTurns) {
+      if (await finishTurn()) continue;
+      return;
+    }
   }
+}
+
+const SUB_AGENT_BANNED_TOOLS: ReadonlySet<string> = new Set(["ask_user", "spawn_agents", "collect_agents"]);
+const SUB_AGENT_MAX_TURNS = 40;
+
+function subAgentSystemPromptFor(projectName: string, folder: string | null, task: string): string {
+  const folderLine = folder
+    ? `The project folder path is: ${folder}`
+    : "The project has no folder selected.";
+  return [
+    `You are an autonomous sub-agent of Faso Code (the coding agent in the desktop app "fasocode"), working on the project "${projectName}". ${folderLine}`,
+    "A main agent delegated the following task to you. It is fully self-contained:",
+    "",
+    task,
+    "",
+    "## How to work",
+    "- You have the same tools as the main agent (read, write, replace, read_lines, run_command, search, list_files, fetch_url, use_skill, create_skill, todo, hypertool). Use them autonomously until the task is done.",
+    "- You CANNOT ask the user questions and you CANNOT spawn or run sub-agents. Work independently and decisively, without narrating.",
+    "- Follow the project's existing structure and conventions. Keep your changes inside the files your task owns.",
+    "- The visible ToDo list is shared with the main agent: only touch it if your task requires it.",
+    "- Finish when your task is truly done; verify with a test or syntax check when possible (run_command).",
+    "",
+    "## When you are done",
+    "Reply with ONLY a concise summary (plain text, no preamble) the main agent can act on:",
+    "- exactly what you changed or produced (file paths, key decisions)",
+    "- verification results (commands run, exit codes, test output highlights)",
+    "- anything the main agent must know, and anything still open",
+    "Keep it under 600 words. Do not add pleasantries or questions.",
+  ].join("\n");
+}
+
+function shortArgs(args: Record<string, unknown>): string {
+  if (typeof args.path === "string" && args.path) return `"${args.path}"`;
+  if (typeof args.command === "string" && args.command) return `(${args.command.slice(0, 40)}…)`;
+  const s = JSON.stringify(args);
+  return s.length > 60 ? `${s.slice(0, 60)}…` : s;
+}
+
+function truncateResult(s: string, n: number): string {
+  return s.length > n ? `${s.slice(0, n)}…` : s;
+}
+
+export type AgentRunParams = {
+  model: Model;
+  apiKey: string;
+  projectName: string;
+  folder: string | null;
+  task: string;
+  reasoningLevel?: ReasoningLevel;
+  contextLength?: number;
+  runTool: (name: string, args: Record<string, unknown>) => Promise<string>;
+};
+
+export async function runAgent(
+  params: AgentRunParams,
+  opts: { onStep?: (line: string) => void } = {},
+  signal?: AbortSignal,
+): Promise<string> {
+  const { model, apiKey, projectName, folder, task, reasoningLevel, contextLength, runTool } = params;
+  const step = opts.onStep ?? (() => {});
+  let finalText = "";
+  await runAgenticLoop(
+    { model, apiKey, projectName, folder, history: [{ role: "user", text: task }], reasoningLevel, contextLength },
+    runTool,
+    {
+      onTurnStart: () => {},
+      onText: (d) => {
+        finalText += d;
+      },
+      onThinking: () => {},
+      onToolStart: (call) => {
+        step(`\n[step] ${call.name}${shortArgs(call.args) ? ` ${shortArgs(call.args)}` : ""}`);
+      },
+      onToolDone: (_call, result) => {
+        step(`\n  → ${truncateResult(result, 400)}`);
+      },
+      onToolError: (_call, error) => {
+        step(`\n  → Error: ${truncateResult(error, 400)}`);
+      },
+    },
+    {
+      systemPrompt: subAgentSystemPromptFor(projectName, folder, task),
+      bannedTools: SUB_AGENT_BANNED_TOOLS,
+      maxTurns: SUB_AGENT_MAX_TURNS,
+    },
+    signal,
+  );
+  return finalText.trim() || "(agent finished without a textual summary)";
 }

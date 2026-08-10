@@ -8,7 +8,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { readTextFile, writeTextFile, readDir, remove } from "@tauri-apps/plugin-fs";
 import { fetch as httpFetch } from "@tauri-apps/plugin-http";
 import { loadState, saveState, flushState } from "./store";
-import { runAgenticLoop, errMessage, fetchModelCapabilities, estimateContextTokens, compactConversation, DEFAULT_CONTEXT_WINDOW, type ReasoningLevel, type ThinkingEffort } from "./ai";
+import { runAgenticLoop, runAgent, errMessage, fetchModelCapabilities, estimateContextTokens, compactConversation, DEFAULT_CONTEXT_WINDOW, type ReasoningLevel, type ThinkingEffort } from "./ai";
 import "./App.css";
 
 const TEXTS = [
@@ -650,6 +650,28 @@ function PromptBox({
 
   return (
     <>
+      {sending && (
+        <div className="cooking-indicator" role="status" aria-live="polite">
+          <span className="cooking-pot">
+            <svg className="cooking-pot-svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M2 12h20" />
+              <path d="M6 12v5a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-5" />
+              <path d="M9 8a3 3 0 0 1 6 0" />
+              <path d="M7 9H4" />
+              <path d="M20 9h-3" />
+            </svg>
+            <span className="cooking-steam steam-1" />
+            <span className="cooking-steam steam-2" />
+            <span className="cooking-steam steam-3" />
+          </span>
+          <span className="cooking-text">Faso is cooking</span>
+          <span className="cooking-dots">
+            <span className="cooking-dot" />
+            <span className="cooking-dot" />
+            <span className="cooking-dot" />
+          </span>
+        </div>
+      )}
       <div className="input-wrap">
         <textarea
           ref={inputRef}
@@ -948,6 +970,11 @@ function App() {
   const messagesRef = useRef<HTMLDivElement>(null);
   const idRef = useRef(1);
   const pendingUndoRef = useRef<UndoData | UndoData[] | null>(null);
+  const subAgentsRef = useRef<Map<string, { controller: AbortController; promise: Promise<string> }>>(new Map());
+  const subAgentBuffersRef = useRef<Map<string, string[]>>(new Map());
+  const subAgentLiveRef = useRef(false);
+  const inSubToolRef = useRef(false);
+  const agentsStallReportedRef = useRef(false);
   const selectedProjectIdRef = useRef<number | null>(null);
   selectedProjectIdRef.current = selectedProjectId;
   const projectsRef = useRef(projects);
@@ -1574,6 +1601,7 @@ function App() {
                     if (e.payload.token !== token) return;
                     const chunk = e.payload.chunk ?? "";
                     if (!chunk) return;
+                    if (inSubToolRef.current && !subAgentLiveRef.current) return;
                     pendingToolStream += chunk;
                     scheduleToolFlush();
                   },
@@ -1671,13 +1699,17 @@ function App() {
             const short = argStr.length > 80 ? `${argStr.slice(0, 80)}…` : argStr;
             const stepOut = `[step ${i + 1}] ${stepName}(${short})\n${stepResult}`;
             results.push(stepOut);
-            if (toolMsgId !== null) appendToolMessageResult(toolMsgId, `\n\n${stepOut}`);
+            if (toolMsgId !== null && !(inSubToolRef.current && !subAgentLiveRef.current)) {
+              appendToolMessageResult(toolMsgId, `\n\n${stepOut}`);
+            }
           } catch (err) {
             const errMsg = `[step ${i + 1}] ${stepName}: ${errMessage(err)}`;
             if (stopOnError) throw new Error(errMsg);
             failed++;
             results.push(errMsg);
-            if (toolMsgId !== null) appendToolMessageResult(toolMsgId, `\n\n${errMsg}`);
+            if (toolMsgId !== null && !(inSubToolRef.current && !subAgentLiveRef.current)) {
+              appendToolMessageResult(toolMsgId, `\n\n${errMsg}`);
+            }
           }
         }
         pendingUndoRef.current = undos.length ? (undos.length === 1 ? undos[0] : undos) : null;
@@ -1857,6 +1889,143 @@ function App() {
           else controller.signal.addEventListener("abort", onAbort, { once: true });
         });
       }
+      if (name === "spawn_agents") {
+        const rawAgents = Array.isArray(args.agents) ? (args.agents as Array<Record<string, unknown>>) : null;
+        if (!rawAgents || rawAgents.length === 0) throw new Error("agents must be a non-empty array of {id, name, task}");
+        if (rawAgents.length > 6) throw new Error("max 6 agents per spawn_agents call");
+        const agents = rawAgents.map((a, i) => ({
+          id: String(a.id ?? `agent-${i + 1}`).trim(),
+          name: String(a.name ?? `Agent ${i + 1}`).trim(),
+          task: String(a.task ?? "").trim(),
+        }));
+        for (const a of agents) {
+          if (!a.id) throw new Error("each agent needs an id");
+          if (!a.task) throw new Error(`agent "${a.id}" is missing a task`);
+          if (subAgentsRef.current.has(a.id)) throw new Error(`agent id "${a.id}" is already running`);
+        }
+        const wait = args.wait === true;
+        const promises: Promise<string>[] = [];
+        const started: Array<{ id: string; name: string; brief: string }> = [];
+        const subRunTool = async (name: string, args2: Record<string, unknown>): Promise<string> => {
+          inSubToolRef.current = true;
+          try {
+            return await runTool(name, args2);
+          } finally {
+            inSubToolRef.current = false;
+          }
+        };
+        for (const a of agents) {
+          const subController = new AbortController();
+          const onAbort = () => subController.abort();
+          controller.signal.addEventListener("abort", onAbort, { once: true });
+          const buffer: string[] = [];
+          subAgentBuffersRef.current.set(a.id, buffer);
+          const promise = runAgent(
+            {
+              model,
+              apiKey,
+              projectName: project.name,
+              folder: project.folder,
+              task: a.task,
+              reasoningLevel,
+              contextLength: ctxDetected ?? contextLengthFor(model),
+              runTool: subRunTool,
+            },
+            {
+              onStep: (line) => {
+                buffer.push(line);
+                if (subAgentLiveRef.current) {
+                  pendingToolStream += line;
+                  scheduleToolFlush();
+                }
+              },
+            },
+            subController.signal,
+          ).finally(() => {
+            controller.signal.removeEventListener("abort", onAbort);
+            subAgentsRef.current.delete(a.id);
+            subAgentBuffersRef.current.delete(a.id);
+          });
+          subAgentsRef.current.set(a.id, { controller: subController, promise });
+          promises.push(promise);
+          started.push({ id: a.id, name: a.name, brief: a.task.replace(/\s+/g, " ").trim().slice(0, 120) });
+        }
+        if (wait) {
+          subAgentLiveRef.current = true;
+          let settled: PromiseSettledResult<string>[];
+          try {
+            settled = await Promise.allSettled(promises);
+          } finally {
+            subAgentLiveRef.current = false;
+          }
+          if (pendingToolStream && toolMsgId !== null) {
+            const chunk = pendingToolStream;
+            pendingToolStream = "";
+            appendToolMessageResult(toolMsgId, chunk);
+          }
+          const lines = started.map((s, i) => {
+            const r = settled[i];
+            return r.status === "fulfilled"
+              ? `## ${s.name} (${s.id})\n${r.value}`
+              : `## ${s.name} (${s.id})\n[error] ${errMessage(r.reason)}`;
+          });
+          return truncateText(lines.join("\n\n"), HYPERTool_RESULT_LIMIT);
+        }
+        return `Spawned ${started.length} background agent(s), working concurrently:\n${started
+          .map((s) => `- ${s.id} (${s.name}): ${s.brief}`)
+          .join("\n")}\n\nCall collect_agents to wait for their results (or end your turn and they are collected automatically).`;
+      }
+      if (name === "collect_agents") {
+        const requestedIds = Array.isArray(args.ids) ? args.ids.map((i) => String(i).trim()).filter(Boolean) : null;
+        const timeout = args.timeout != null ? Math.min(600, Math.max(1, Math.round(Number(args.timeout)))) : 120;
+        const entries =
+          requestedIds && requestedIds.length > 0
+            ? requestedIds.filter((id) => subAgentsRef.current.has(id)).map((id) => [id, subAgentsRef.current.get(id)!] as const)
+            : [...subAgentsRef.current.entries()];
+        if (requestedIds && requestedIds.length > 0) {
+          const missing = requestedIds.filter((id) => !subAgentsRef.current.has(id));
+          if (entries.length === 0) return missing.length > 0 ? `(no running agent matches: ${missing.join(", ")})` : "(no agents running)";
+        } else if (entries.length === 0) {
+          return "(no background agents running)";
+        }
+        subAgentLiveRef.current = true;
+        let settled: PromiseSettledResult<string>[] | null = null;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const allSettledP = Promise.allSettled(entries.map(([, a]) => a.promise));
+          const result = await Promise.race([
+            allSettledP,
+            new Promise<null>((resolve) => {
+              timer = setTimeout(() => resolve(null), timeout * 1000);
+            }),
+          ]);
+          if (result !== null) settled = result;
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+          subAgentLiveRef.current = false;
+        }
+        if (pendingToolStream && toolMsgId !== null) {
+          const chunk = pendingToolStream;
+          pendingToolStream = "";
+          appendToolMessageResult(toolMsgId, chunk);
+        }
+        if (settled === null) {
+          const running = entries.map(([id]) => {
+            const buf = subAgentBuffersRef.current.get(id);
+            const progress = buf && buf.length > 0 ? `\n\n(progress so far)\n${buf.join("").slice(0, 4000)}` : "";
+            return `## ${id}\n[running after ${timeout}s — call collect_agents again later]${progress}`;
+          });
+          return `Timed out after ${timeout}s — ${entries.length} agent(s) still running:\n\n${running.join("\n\n")}`;
+        }
+        const lines = entries.map(([id, a], i) => {
+          const r = settled[i];
+          const label = a.controller.signal.aborted ? `${id} (aborted)` : id;
+          return r.status === "fulfilled"
+            ? `## ${label}\n${r.value}`
+            : `## ${label}\n[error] ${errMessage(r.reason)}`;
+        });
+        return truncateText(lines.join("\n\n"), HYPERTool_RESULT_LIMIT);
+      }
       const pathArg = typeof args.path === "string" ? args.path : "";
       const filePath = resolveInProject(project.folder, pathArg);
       switch (name) {
@@ -1905,6 +2074,41 @@ function App() {
         default:
           throw new Error(`Unknown tool: ${name}`);
       }
+    };
+
+    const collectPendingAgents = async (): Promise<string | null> => {
+      if (controller.signal.aborted) return null;
+      const entries = [...subAgentsRef.current.entries()];
+      if (entries.length === 0) return null;
+      const allSettledP = Promise.allSettled(entries.map(([, a]) => a.promise));
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const done = await Promise.race([
+        allSettledP,
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), 600_000);
+        }),
+      ]);
+      if (timer !== undefined) clearTimeout(timer);
+      if (controller.signal.aborted) return null;
+      if (done === null) {
+        if (agentsStallReportedRef.current) return null;
+        agentsStallReportedRef.current = true;
+        const running = entries.map(([id]) => {
+          const buf = subAgentBuffersRef.current.get(id);
+          const progress = buf && buf.length > 0 ? `\n\n(progress so far)\n${buf.join("").slice(0, 2000)}` : "";
+          return `## ${id}\n[running — call collect_agents to wait for it]${progress}`;
+        });
+        return `Some background agents are still running:\n\n${running.join("\n\n")}\n\nYou may call collect_agents to wait for them, or continue with other work.`;
+      }
+      agentsStallReportedRef.current = false;
+      const lines = entries.map(([id, a], i) => {
+        const r = done[i];
+        const label = a.controller.signal.aborted ? `${id} (aborted)` : id;
+        return r.status === "fulfilled"
+          ? `## ${label}\n${r.value}`
+          : `## ${label}\n[error] ${errMessage(r.reason)}`;
+      });
+      return `Background agents finished:\n\n${truncateText(lines.join("\n\n"), HYPERTool_RESULT_LIMIT)}`;
     };
 
     try {
@@ -1977,7 +2181,16 @@ function App() {
           onToolError: (_call, error) => {
             if (toolMsgId !== null) updateToolMessage(toolMsgId, "error", error);
           },
+          onAgentsCollected: (summary) => {
+            appendMessage({
+              id: idRef.current++,
+              role: "assistant",
+              text: summary,
+              sentAt: Date.now(),
+            });
+          },
         },
+        { collectPendingAgents },
         controller.signal,
       );
     } catch (err) {
@@ -2020,6 +2233,7 @@ function App() {
       setTimerActive(false);
       setSending(false);
       sendAbortRef.current = null;
+      subAgentLiveRef.current = false;
     }
   }
 
