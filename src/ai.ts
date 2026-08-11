@@ -705,6 +705,26 @@ const TOOLS = [
   {
     type: "function",
     function: {
+      name: "search_web",
+      description:
+        "Search the web for a query and return the top results (title, URL, snippet). Two engines are available via the 'engine' parameter: 'duckduckgo' (free, no API key, default) and 'brave' (requires a Brave Search API key configured in Settings; returns fresher, higher-quality results). Use it for up-to-date information, documentation, package versions, or anything not answerable from the project itself. Prefer engine 'duckduckgo' unless you need Brave's better coverage.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "The search query" },
+          engine: {
+            type: "string",
+            enum: ["duckduckgo", "brave"],
+            description: "Search engine to use (default: duckduckgo)",
+          },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "ask_user",
       description:
         "Ask the user one or more clarifying questions and wait for their answers. Use this whenever you need information, a decision, or confirmation from the user before proceeding. " +
@@ -778,11 +798,12 @@ const TOOLS = [
       name: "spawn_agents",
       description:
         "Delegate independent work to one or more background sub-agents that run CONCURRENTLY. Each sub-agent is a full autonomous agent with the same tools, except it cannot ask the user questions and cannot spawn further agents. " +
-        "With wait=false (default) this returns immediately with the agent ids and they keep working asynchronously in the background while you do other work; retrieve their summaries later with collect_agents. " +
-        "With wait=true it blocks until every agent finishes and returns all summaries at once (use for a parallel batch whose results you need before doing anything else). " +
-        "Use it for genuinely independent chunks of work (separate files or features, separate research lookups, generating tests while you refactor). " +
-        "Do NOT use it when the pieces depend on each other's output, when two agents would edit the same file (they will conflict), when the work needs user input, or for small tasks you can just do yourself. " +
-        "Give each agent a self-contained task: the goal, the exact files it owns, deliverables, and how to verify.",
+        "There are exactly two modes, chosen via 'wait': with wait=false (default) the call returns immediately with the agent ids and the agents keep working asynchronously in the background while you continue your own work — retrieve their summaries later with collect_agents (or just end your turn: pending agents are collected automatically and handed back to you). " +
+        "With wait=true the call blocks until every agent finishes and returns all summaries at once. " +
+        "Decision rule: use wait=false (async) ONLY when you have real work of your own to do while the agents run; use wait=true (blocking) when the agents' results are a hard prerequisite for your next step and you would otherwise wait idle. " +
+        "Use agents only for genuinely independent chunks of work that are big enough to justify the overhead (roughly more than a few tool calls each) — separate files or features, separate research lookups, generating tests while you refactor. " +
+        "Do NOT use it when the pieces depend on each other's output (do them yourself, in order), when two agents would edit the same file (they will conflict — each agent must own its files exclusively), when the work needs user input, or when the work is small enough to batch into one hypertool call instead. " +
+        "Give each agent a fully self-contained task: the goal, the exact files it owns, deliverables, and how to verify. Prefer 1-4 agents; never more than 6. Delegating poorly is worse than not delegating.",
       parameters: {
         type: "object",
         properties: {
@@ -901,8 +922,10 @@ function systemPromptFor(projectName: string, folder: string | null): string {
     "- search(query, path?, file_pattern?): search file contents in the project folder (case-insensitive substring; returns path:line matches). Use it before reading files to find exactly where things live.",
     "- list_files(path?, extensions?): recursively list project files in one call (directories end with /). Use it to discover the project structure instead of guessing paths.",
     "- fetch_url(url): fetch a web page's text content. Use it for documentation or reference lookups; prefer official docs and avoid unnecessary fetches.",
+    "- search_web(query, engine?): search the web and return top results (title, URL, snippet). engine is 'duckduckgo' (default, no API key) or 'brave' (needs a Brave Search API key in Settings → Providers). Use it for up-to-date info, docs, package versions, and anything not answerable from the project itself.",
     "- ask_user(questions): ask the user one or more structured questions and wait for their answers. Each question has a type: choice (pick one of options), toggle (turn any subset of options on), confirm (yes/no), input (free text), or mix (a structured choice with an extra input field at the end for notes). Use this any time you need clarification, a decision, or confirmation — never guess when the user could decide in one click. Batch related questions into a single call when possible.",
     "- hypertool(steps, stop_on_error?): execute a SEQUENCE of tool calls as a single tool call. steps is an array of {name, args} (e.g. write several files, read several files, or any mix of read/write/replace/search/run_command/...). Steps run in order and every result is returned with its step number, so one hypertool call replaces many ordinary calls — this is your batching hammer. Never nest hypertool, never include ask_user.",
+    "- spawn_agents(agents, wait?) / collect_agents(ids?, timeout?): delegate independent chunks of work to concurrent sub-agents. wait=false (default) is async: agents run in the background while you keep working, and you collect their results with collect_agents (or just end your turn — pending agents are collected automatically). wait=true blocks and returns every agent's summary in one result. See the 'Delegation' section below for exactly when to use each mode, and when not to delegate at all.",
     "Tool results are appended to the conversation automatically and displayed in the UI, so do not repeat them back verbatim in your replies.",
     "",
     "## Slash commands",
@@ -939,13 +962,24 @@ function systemPromptFor(projectName: string, folder: string | null): string {
     "7. Spend calls generously ONLY on: irreversible or destructive actions (verify before committing, every time), genuine ambiguity that changes the deliverable (one targeted check or clarifying question is cheaper than doing the wrong thing well), high-stakes correctness (security, financial, safety-critical code), and volatile or time-sensitive facts.",
     "8. Anti-patterns (never do these): searching or reading 'to be safe' when you already have a confident, groundable answer; re-reading the same file without new cause; splitting a batchable operation into a loop of single-item calls; performing a broad exploratory sweep before forming a hypothesis; verifying your own successful action with a second read-back; continuing to act after the definition of done has been met; asking the user for information that one tool call could resolve; making a tool call as a substitute for thinking.",
     "",
-    "## Parallel agents (spawn_agents / collect_agents)",
-    "You can delegate independent work to background sub-agents. Each sub-agent is a full autonomous agent with the same tools, except it cannot ask the user questions and cannot spawn more agents.",
-    "- spawn_agents(agents, wait?): agents is [{id, name, task}], 1-4 recommended (max 6). Each agent runs concurrently. With wait=false (default) it returns immediately and the agents keep working in the background while you continue your own work; with wait=true it blocks and returns every agent's summary at once — use that for a parallel batch whose results you need before doing anything else.",
-    "- collect_agents(ids?, timeout?): blocks until the listed agents finish (default 120s, max 600s) and returns their summaries. Call it before ending your turn so you can incorporate the results into your final reply. If any agents are still running when your turn ends, their results are collected automatically, handed back to you as a message, and your turn continues — you never have to wait idle.",
-    "USE agents when: several chunks of work are genuinely independent (features in different files, separate research lookups, generating tests while you refactor, parallel experiments), AND the work is big enough to justify the overhead of an agent (roughly: more than a few tool calls).",
-    "DO NOT use agents when: the pieces depend on each other's output (do them yourself, in order); two agents would edit the same file (they will conflict — only delegate files that a single agent owns); the work needs user input; the task is a single small edit (just do it); or the work is trivial. Delegating poorly is worse than not delegating: if you cannot write each task as a fully self-contained brief, do the work yourself.",
-    "Give each agent a self-contained task: the goal, the exact files it owns, deliverables, and how to verify. Prefer few agents over many; keep the agent count modest (1-4).",
+    "## Delegation: background agents (spawn_agents / collect_agents)",
+    "You can delegate independent work to sub-agents that run concurrently. A sub-agent is a full autonomous agent with the same tools, except it cannot ask the user questions and cannot spawn further agents. There are exactly two modes — pick one explicitly for each spawn_agents call:",
+    "",
+    "### Mode A — async agents (wait=false, default)",
+    "spawn_agents returns instantly with the agent ids; the agents work in the background while YOU keep working. Call collect_agents when you need their results, or simply end your turn — any pending agents are collected automatically and handed back to you as a message, and your turn continues.",
+    "USE Mode A ONLY when you have real work of your own to do in parallel: you keep making progress on the main path while the agents chew on their chunks, then collect before your final reply.",
+    "",
+    "### Mode B — blocking delegation (wait=true)",
+    "spawn_agents blocks until every agent finishes and returns all summaries in one result.",
+    "USE Mode B when the agents' output is a hard prerequisite for your next step and you would otherwise sit idle — delegate the whole parallel batch in one call, wait, then act on everything.",
+    "",
+    "### Choose by what your main thread needs",
+    "- Main thread has other useful work while agents run → Mode A (async), then collect_agents before your final reply.",
+    "- Everything you do next depends on the agents' results → Mode B (blocking).",
+    "- The work is small (a few tool calls) → no agents; do it yourself or batch it in ONE hypertool call. Agents cost real overhead — never delegate what you can just execute.",
+    "- The pieces are not genuinely independent, or two chunks would touch the same file → no agents; do them yourself, in order. Each agent must own its files exclusively.",
+    "- Anything needing user input, or a task you cannot write as a fully self-contained brief → no agents.",
+    "Each agent task must be self-contained: the goal, the exact files it owns, deliverables, and how to verify. Prefer 1-4 agents; never more than 6. Delegating poorly is worse than not delegating: if you cannot write each brief with everything the agent needs, do the work yourself.",
     "",
     "## Plans are reviewed by the user",
     "- For any task beyond a single obvious edit: do NOT start executing immediately. First reply with a big, highly detailed plan in Markdown — the exact files to create or modify, the content outline, the commands to run, and the verification steps — then STOP (no tool calls) so the user can review it.",
@@ -1589,7 +1623,7 @@ function subAgentSystemPromptFor(projectName: string, folder: string | null, tas
     task,
     "",
     "## How to work",
-    "- You have the same tools as the main agent (read, write, replace, read_lines, run_command, search, list_files, fetch_url, use_skill, create_skill, todo, hypertool). Use them autonomously until the task is done.",
+    "- You have the same tools as the main agent (read, write, replace, read_lines, run_command, search, list_files, fetch_url, search_web, use_skill, create_skill, todo, hypertool). Use them autonomously until the task is done.",
     "- You CANNOT ask the user questions and you CANNOT spawn or run sub-agents. Work independently and decisively, without narrating.",
     "- Follow the project's existing structure and conventions. Keep your changes inside the files your task owns.",
     "- The visible ToDo list is shared with the main agent: only touch it if your task requires it.",

@@ -41,7 +41,7 @@ export type UserMessage = {
 };
 export type TodoItem = { id: number; task: string; done: boolean };
 export type Chat = { id: number; name: string; messages: UserMessage[]; todos: TodoItem[] };
-export type Project = { id: number; name: string; folder: string | null; chats: Chat[] };
+export type Project = { id: number; name: string; folder: string | null; chats: Chat[]; favorite: boolean };
 
 function MenuIcon() {
   return (
@@ -74,6 +74,14 @@ function ChatBubbleIcon() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z" />
+    </svg>
+  );
+}
+
+function StarIcon({ filled }: { filled?: boolean }) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill={filled ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z" />
     </svg>
   );
 }
@@ -119,6 +127,15 @@ const PROVIDERS: { id: string; name: string }[] = [
   { id: "google", name: "Google" },
   { id: "openrouter", name: "OpenRouter" },
   { id: "nvidia-nim", name: "Nvidia NIM" },
+];
+
+const SEARCH_ENGINES: { id: string; name: string; keyLabel: string; keyLink: string }[] = [
+  {
+    id: "brave",
+    name: "Brave Search",
+    keyLabel: "Brave Search API key",
+    keyLink: "https://brave.com/search/api/",
+  },
 ];
 
 function PlusIcon() {
@@ -320,6 +337,33 @@ function resolveInProject(folder: string | null, rel: string): string {
 
 function truncateText(s: string, limit: number): string {
   return s.length > limit ? `${s.slice(0, limit)}\n...[truncated]` : s;
+}
+
+function stripSearchHtml(s: string): string {
+  return s
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&#x27;/gi, "'")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function ddgResultUrl(href: string): string {
+  const raw = href.startsWith("//") ? `https:${href}` : href;
+  const m = raw.match(/[?&]uddg=([^&]+)/);
+  if (m) {
+    try {
+      return decodeURIComponent(m[1]);
+    } catch {
+      return raw;
+    }
+  }
+  return raw;
 }
 
 function hypertoolArgSummary(args: Record<string, unknown>): string {
@@ -1012,6 +1056,7 @@ function App() {
             setProjects(
               savedProjects.map((p) => ({
                 ...p,
+                favorite: p.favorite === true,
                 folder: p.folder ?? null,
                 chats: Array.isArray(p.chats)
                   ? p.chats.map((c) => ({
@@ -1194,10 +1239,14 @@ function App() {
   function createProject() {
     const name = projectName.trim();
     if (!name || !projectFolder || !trustChecked) return;
-    const project: Project = { id: idRef.current++, name, folder: projectFolder, chats: [] };
+    const project: Project = { id: idRef.current++, name, folder: projectFolder, chats: [], favorite: false };
     setProjects((p) => [...p, project]);
     setSelectedProjectId(project.id);
     closeNewProject();
+  }
+
+  function toggleFavorite(projectId: number) {
+    setProjects((ps) => ps.map((p) => (p.id === projectId ? { ...p, favorite: !p.favorite } : p)));
   }
 
   function createChat(projectId: number) {
@@ -1838,6 +1887,62 @@ function App() {
             .trim();
         }
         return truncateText(text, READ_CHUNK_LIMIT);
+      }
+      if (name === "search_web") {
+        const query = String(args.query ?? "").trim();
+        if (!query) throw new Error("query is required");
+        const engine = args.engine === "brave" ? "brave" : "duckduckgo";
+        const searchController = new AbortController();
+        const timer = setTimeout(() => searchController.abort(), 20000);
+        try {
+          if (engine === "brave") {
+            const key = (apiKeys.brave ?? "").trim();
+            if (!key) {
+              throw new Error(
+                "Brave Search API key is not configured. Add it in Settings → Providers, or retry with engine 'duckduckgo'.",
+              );
+            }
+            const res = await httpFetch(
+              `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=10`,
+              { headers: { "X-Subscription-Token": key }, signal: searchController.signal },
+            );
+            if (!res.ok) throw new Error(`Brave Search API returned HTTP ${res.status}`);
+            const data = (await res.json()) as {
+              web?: { results?: { title?: string; url?: string; description?: string }[] };
+            };
+            const results = data.web?.results ?? [];
+            if (results.length === 0) return "(no results found)";
+            return results
+              .slice(0, 10)
+              .map((r, i) => `${i + 1}. ${r.title ?? "(untitled)"}\n   ${r.url ?? ""}\n   ${r.description ?? ""}`)
+              .join("\n");
+          }
+          const res = await httpFetch(
+            `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
+            { headers: { "User-Agent": "fasocode" }, signal: searchController.signal },
+          );
+          if (!res.ok) throw new Error(`DuckDuckGo returned HTTP ${res.status}`);
+          const html = await res.text();
+          const lines: string[] = [];
+          for (const block of html.split(/<div class="result\b/).slice(1)) {
+            if (lines.length >= 10) break;
+            const anchor = block.match(/<a[^>]*class="[^"]*result__a[^"]*"[^>]*>/);
+            if (!anchor) continue;
+            const href = anchor[0].match(/href="([^"]+)"/)?.[1] ?? "";
+            const title = stripSearchHtml(
+              block.match(/<a[^>]*class="[^"]*result__a[^"]*"[^>]*>([\s\S]*?)<\/a>/)?.[1] ?? "",
+            );
+            const snippet = stripSearchHtml(
+              (block.match(/<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/) ??
+                block.match(/class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/div>/))?.[1] ?? "",
+            );
+            if (!title && !snippet) continue;
+            lines.push(`${lines.length + 1}. ${title || "(untitled)"}\n   ${ddgResultUrl(href)}\n   ${snippet}`);
+          }
+          return lines.length > 0 ? lines.join("\n") : "(no results found)";
+        } finally {
+          clearTimeout(timer);
+        }
       }
       if (name === "search") {
         const query = String(args.query ?? "").trim();
@@ -2723,9 +2828,11 @@ function App() {
           </div>
           <div className="sidebar-divider" />
           <ul className="project-list">
-            {projects.map((p) => (
+            {[...projects]
+              .sort((a, b) => Number(b.favorite) - Number(a.favorite))
+              .map((p) => (
               <li key={p.id}>
-                <div className={`project-row ${selectedProjectId === p.id ? "active" : ""}`}>
+                <div className={`project-row ${selectedProjectId === p.id ? "active" : ""} ${p.favorite ? "favorite" : ""}`}>
                   <button
                     className="new-chat-btn"
                     aria-label="New Chat"
@@ -2735,6 +2842,14 @@ function App() {
                     <span className="tooltip" role="tooltip">New Chat</span>
                   </button>
                   <span className="project-name" onClick={() => setSelectedProjectId(p.id)}>{p.name}</span>
+                  <button
+                    className={`fav-btn ${p.favorite ? "active" : ""}`}
+                    aria-label={p.favorite ? "Remove from favorites" : "Add to favorites"}
+                    title={p.favorite ? "Remove from favorites" : "Add to favorites"}
+                    onClick={() => toggleFavorite(p.id)}
+                  >
+                    <StarIcon filled={p.favorite} />
+                  </button>
                 </div>
                 {selectedProjectId === p.id && p.chats.length > 0 && (
                   <ul className="chat-list">
@@ -3110,6 +3225,22 @@ function App() {
                         </div>
                       ))}
                     </div>
+                    <h3 className="settings-section-subtitle">Search Engines</h3>
+                    <div className="provider-list">
+                      {SEARCH_ENGINES.map((s) => (
+                        <div key={s.id} className="provider-row">
+                          <span className="provider-name">{s.name}</span>
+                          <button
+                            className={`key-btn ${apiKeys[s.id] ? "set" : ""}`}
+                            aria-label="API Key"
+                            onClick={() => setKeyModalProvider(s.id)}
+                          >
+                            <KeyIcon />
+                            <span className="tooltip" role="tooltip">{s.keyLabel}</span>
+                          </button>
+                        </div>
+                      ))}
+                    </div>
                   </>
                 ) : settingsSection === "Skills" ? (
                   <>
@@ -3438,7 +3569,10 @@ function App() {
           >
             <div className="modal">
               <h2 className="modal-title">
-                API Key - {PROVIDERS.find((p) => p.id === keyModalProvider)?.name}
+                API Key -{" "}
+                {PROVIDERS.find((p) => p.id === keyModalProvider)?.name ??
+                  SEARCH_ENGINES.find((s) => s.id === keyModalProvider)?.name ??
+                  keyModalProvider}
               </h2>
               <input
                 className="modal-input"
